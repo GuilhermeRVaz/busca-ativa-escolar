@@ -5,10 +5,11 @@ class WhatsAppLinkBuilder:
     def __init__(self, message_template: str) -> None:
         self.message_template = message_template
 
-    def build_message(self, parent_name: str, student_name: str) -> str:
+    def build_message(self, parent_name: str, student_name: str, absence_days: str = "") -> str:
         return self.message_template.format(
             parent_name=(parent_name or "responsável").strip(),
             student_name=(student_name or "aluno(a)").strip(),
+            absence_days=(absence_days or "dias não informados").strip(),
         )
 
     def build_link(self, phone_number: str, message: str) -> str:

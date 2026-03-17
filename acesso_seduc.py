@@ -13,13 +13,26 @@ def unificar_relatorios():
         print("\n⚠️ Nenhum arquivo encontrado para unificar.")
         return
 
-    print("\n📊 Gerando Relatório Consolidado...")
+    print("\n📊 Gerando Relatório Consolidado e limpando cabeçalhos da SEDUC...")
     lista_df = []
 
     for arquivo in arquivos:
         nome_turma = os.path.basename(arquivo).replace("Faltas_", "").replace(".xlsx", "").replace("_", " ")
         try:
-            df = pd.read_excel(arquivo)
+            # 1. Lê o arquivo "cru" para descobrir onde os dados realmente começam
+            raw_df = pd.read_excel(arquivo, header=None)
+            
+            header_idx = 0
+            # Procura a linha que contém "RA" e "NOME"
+            for index, row in raw_df.iterrows():
+                valores = [str(v).strip().upper() for v in row.values if pd.notna(v)]
+                if "NOME" in valores and "RA" in valores:
+                    header_idx = index
+                    break
+            
+            # 2. Lê o arquivo novamente, mas agora informando a linha correta do cabeçalho
+            df = pd.read_excel(arquivo, header=header_idx)
+
             # Só adiciona se o arquivo não estiver vazio
             if not df.empty:
                 df.insert(0, 'Turma', nome_turma)
@@ -29,9 +42,9 @@ def unificar_relatorios():
 
     if lista_df:
         df_final = pd.concat(lista_df, ignore_index=True)
-        nome_saida = "Relatorio_Consolidado_BuscaAtiva.xlsx"
+        nome_saida = os.path.join(path, "Relatorio_Consolidado_BuscaAtiva.xlsx")
         df_final.to_excel(nome_saida, index=False)
-        print(f"✨ PERFEITO! Arquivo consolidado criado: {nome_saida}")
+        print(f"✨ PERFEITO! Arquivo consolidado e limpo criado: {nome_saida}")
     else:
         print("⚠️ Não havia dados válidos para consolidar.")
 

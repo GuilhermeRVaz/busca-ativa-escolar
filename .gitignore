@@ -25,3 +25,13 @@ Ready_To_Send_List.xlsx
 .idea/
 Thumbs.db
 Desktop.ini
+
+Relatorio_Consolidado_BuscaAtiva.xlsx
+
+# Ignorar dados do navegador e relatórios pesados
+user_data/
+relatorios/
+*.xlsx
+*.csv
+venv/
+__pycache__/

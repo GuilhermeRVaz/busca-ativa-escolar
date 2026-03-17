@@ -35,11 +35,11 @@ def get_settings() -> Settings:
         base_dir=BASE_DIR,
         consolidated_report_path=_resolve_path(
             os.getenv("CONSOLIDATED_REPORT_PATH", ""),
-            "Relatorio_Consolidado_BuscaAtiva.xlsx",
+            "relatorios/Relatorio_Consolidado_BuscaAtiva.xlsx",
         ),
         ready_to_send_output_path=_resolve_path(
             os.getenv("READY_TO_SEND_OUTPUT_PATH", ""),
-            "Ready_To_Send_List.xlsx",
+            "relatorios/Ready_To_Send_List.xlsx",
         ),
         google_sheet_url=os.getenv("GOOGLE_SHEET_URL", "").strip(),
         google_sheet_worksheet=os.getenv("GOOGLE_SHEET_WORKSHEET", "Contatos").strip(),
@@ -52,9 +52,9 @@ def get_settings() -> Settings:
         whatsapp_message_template=os.getenv(
             "WHATSAPP_MESSAGE_TEMPLATE",
             (
-                "Olá {parent_name}, aqui é da escola. Notamos que o(a) aluno(a) "
-                "{student_name} apresentou ausências recentes. Poderia, por favor, "
-                "nos informar o motivo?"
+                "Olá {parent_name}, aqui é da escola. Informamos que o(a) aluno(a) "
+                "{student_name} apresentou faltas nos dias: {absence_days}. "
+                "Pedimos que informe a justificativa ou entre em contato com a escola."
             ),
         ).strip(),
     )

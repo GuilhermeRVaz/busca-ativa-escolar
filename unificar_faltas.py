@@ -31,8 +31,9 @@ def unificar_excel():
     # Junta todos os DataFrames em um só
     df_final = pd.concat(lista_df, ignore_index=True)
 
-    # Salva o resultado final
-    nome_saida = "Relatorio_Mestre_Faltas_Marco.xlsx"
+    # Salva o resultado final dentro da pasta relatorios/
+    os.makedirs(path, exist_ok=True)
+    nome_saida = os.path.join(path, "Relatorio_Mestre_Faltas_Marco.xlsx")
     df_final.to_excel(nome_saida, index=False)
     
     print(f"\n✨ SUCESSO! Todos os dados foram unidos em: {nome_saida}")

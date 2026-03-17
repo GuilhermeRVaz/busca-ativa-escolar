@@ -64,10 +64,22 @@ class ActiveSchoolSearchProcessor:
         )
         prepared["total_absences"] = normalized_days.sum(axis=1).astype(int)
         prepared["absence_days_with_records"] = normalized_days.gt(0).sum(axis=1).astype(int)
-        prepared = prepared[prepared["ra_key"].notna()].copy()
-        prepared = prepared[prepared["total_absences"] > 0].copy()
 
-        logger.info("Relatório processado com %s aluno(s) com falta.", len(prepared))
+        # Extrai a lista de dias em que o aluno faltou (ex.: "3, 7, 15, 18")
+        def _extract_absence_days(row: pd.Series) -> str:
+            return ", ".join(
+                str(day)
+                for day in day_columns
+                if row.get(day, 0) > 0
+            )
+
+        prepared["absence_days"] = normalized_days.apply(_extract_absence_days, axis=1)
+
+        prepared = prepared[prepared["ra_key"].notna()].copy()
+        # Apenas alunos com 2 ou mais dias de falta (regra da busca ativa)
+        prepared = prepared[prepared["absence_days_with_records"] >= 2].copy()
+
+        logger.info("Relatório processado com %s aluno(s) com ≥2 faltas.", len(prepared))
         return prepared
 
     def load_contacts_from_google_sheet(self) -> pd.DataFrame:
@@ -80,20 +92,39 @@ class ActiveSchoolSearchProcessor:
                 f"Arquivo de credenciais não encontrado: {credentials_file}",
             )
 
-        logger.info(
-            "Lendo Google Sheets: aba '%s'",
-            self.settings.google_sheet_worksheet,
-        )
         client = gspread.service_account(filename=str(credentials_file))
         workbook = client.open_by_url(self.settings.google_sheet_url)
-        worksheet = workbook.worksheet(self.settings.google_sheet_worksheet)
-        records = worksheet.get_all_records()
 
-        if not records:
-            raise ValueError("A aba do Google Sheets está vazia.")
+        # Determina quais abas ler: usa GOOGLE_SHEET_WORKSHEET como lista separada
+        # por vírgula, ou lê TODAS as abas da planilha se o valor for "*" ou vazio.
+        worksheet_setting = self.settings.google_sheet_worksheet.strip()
+        if worksheet_setting and worksheet_setting != "*":
+            tab_names = [t.strip() for t in worksheet_setting.split(",")]
+        else:
+            tab_names = [ws.title for ws in workbook.worksheets()]
 
-        contacts_df = pd.DataFrame(records)
-        logger.info("Planilha carregada com %s registro(s).", len(contacts_df))
+        logger.info("Lendo Google Sheets: abas %s", tab_names)
+
+        all_records: list[pd.DataFrame] = []
+        for tab in tab_names:
+            try:
+                worksheet = workbook.worksheet(tab)
+                records = worksheet.get_all_records()
+                if records:
+                    df_tab = pd.DataFrame(records)
+                    df_tab["_tab"] = tab  # identifica a turma de origem
+                    all_records.append(df_tab)
+                    logger.info("Aba '%s': %s registro(s).", tab, len(records))
+                else:
+                    logger.warning("Aba '%s' está vazia — ignorada.", tab)
+            except Exception as exc:
+                logger.warning("Erro ao ler aba '%s': %s — ignorada.", tab, exc)
+
+        if not all_records:
+            raise ValueError("Nenhuma aba do Google Sheets continha dados válidos.")
+
+        contacts_df = pd.concat(all_records, ignore_index=True)
+        logger.info("Total de contatos carregados: %s", len(contacts_df))
         return self.prepare_contacts_dataframe(contacts_df)
 
     def prepare_contacts_dataframe(self, contacts_df: pd.DataFrame) -> pd.DataFrame:
@@ -101,21 +132,32 @@ class ActiveSchoolSearchProcessor:
         renamed_columns = {column: self._normalize_column_name(column) for column in df.columns}
         df = df.rename(columns=renamed_columns)
 
+        # Filtra alunos transferidos (TRAN) ou com baixa (BXTR) — não devem receber contato
+        situacao_column = self._pick_column(df, ["situacao"])
+        if situacao_column:
+            _situacoes_excluidas = {"TRAN", "BXTR"}
+            mask_excluidos = df[situacao_column].astype(str).str.strip().str.upper().isin(_situacoes_excluidas)
+            n_excluidos = mask_excluidos.sum()
+            if n_excluidos:
+                logger.info("Excluindo %s aluno(s) com situação TRAN/BXTR.", n_excluidos)
+            df = df[~mask_excluidos].copy()
+
         ra_column = self._pick_column(df, ["ra"])
         ra_digit_column = self._pick_column(df, ["dig_ra", "digito_ra"])
-        parent_name_column = self._pick_column(
+        student_name_column = self._pick_column(
             df,
-            ["nome_responsavel", "responsavel", "nome_do_responsavel"],
+            ["nome_do_aluno", "nome_aluno", "aluno", "nome"],
         )
-        phone_column = self._pick_column(
-            df,
-            ["telefone_1", "telefone1", "telefone", "celular", "fone_1"],
-        )
-        student_name_column = self._pick_column(df, ["nome_aluno", "aluno", "nome"])
 
-        if not ra_column or not phone_column:
+        if not ra_column:
             raise KeyError(
-                "A planilha precisa ter, no mínimo, as colunas RA e Telefone 1.",
+                "A planilha precisa ter, no mínimo, a coluna RA.",
+            )
+
+        contact_slots = self._extract_contact_slots(df)
+        if not contact_slots:
+            raise KeyError(
+                "A planilha precisa ter pelo menos uma combinação de nome do responsável e telefone.",
             )
 
         prepared = pd.DataFrame()
@@ -129,18 +171,28 @@ class ActiveSchoolSearchProcessor:
             lambda row: self.build_ra_key(row["ra_base"], row["ra_digit"]),
             axis=1,
         )
-        prepared["parent_name"] = (
-            df[parent_name_column].astype(str).str.strip()
-            if parent_name_column
-            else "Responsável"
-        )
         prepared["contact_student_name"] = (
             df[student_name_column].astype(str).str.strip()
             if student_name_column
             else ""
         )
-        prepared["phone_raw"] = df[phone_column].astype(str).str.strip()
-        prepared["phone_sanitized"] = prepared["phone_raw"].apply(self.sanitize_phone_number)
+        prepared["parent_name"] = ""
+        prepared["phone_raw"] = ""
+        prepared["phone_sanitized"] = ""
+        prepared["contact_slot"] = ""
+
+        for index, slot in enumerate(contact_slots, start=1):
+            slot_name_series = df[slot["name"]].fillna("").astype(str).str.strip()
+            slot_phone_series = df[slot["phone"]].fillna("").astype(str).str.strip()
+            slot_phone_clean = slot_phone_series.apply(self.sanitize_phone_number)
+            empty_phone_mask = prepared["phone_sanitized"].eq("") & slot_phone_clean.ne("")
+
+            prepared.loc[empty_phone_mask, "parent_name"] = slot_name_series[empty_phone_mask]
+            prepared.loc[empty_phone_mask, "phone_raw"] = slot_phone_series[empty_phone_mask]
+            prepared.loc[empty_phone_mask, "phone_sanitized"] = slot_phone_clean[empty_phone_mask]
+            prepared.loc[empty_phone_mask, "contact_slot"] = f"responsavel_{index}"
+
+        prepared["parent_name"] = prepared["parent_name"].replace("", "Responsável")
         prepared["contact_found"] = True
 
         prepared = prepared.dropna(subset=["ra_key"]).drop_duplicates(subset=["ra_key"])
@@ -161,11 +213,16 @@ class ActiveSchoolSearchProcessor:
         )
         merged["parent_name"] = merged["parent_name"].fillna("Responsável")
         merged["phone_sanitized"] = merged["phone_sanitized"].fillna("")
+        # Garante coluna absence_days mesmo se vier vazia do relatório
+        if "absence_days" not in merged.columns:
+            merged["absence_days"] = ""
+        merged["absence_days"] = merged["absence_days"].fillna("").astype(str)
         merged["contact_status"] = merged.apply(self._build_contact_status, axis=1)
         merged["whatsapp_message"] = merged.apply(
             lambda row: self.link_builder.build_message(
                 row["parent_name"],
                 row["student_name"],
+                row["absence_days"],
             ),
             axis=1,
         )
@@ -273,6 +330,37 @@ class ActiveSchoolSearchProcessor:
             if candidate in df.columns:
                 return candidate
         return None
+
+    @staticmethod
+    def _extract_contact_slots(df: pd.DataFrame) -> list[dict[str, str]]:
+        slots: list[dict[str, str]] = []
+        candidate_pairs = [
+            # Padrão da planilha real: "responsavel 1" → "responsavel_1"
+            ("responsavel_1", "telefone_1"),
+            ("responsavel_2", "telefone_2"),
+            ("responsavel_3", "telefone_3"),
+            # Variantes sem número (coluna única)
+            ("responsavel", "telefone"),
+            # Padrões alternativos com prefixo "nome_"
+            ("nome_responsavel", "telefone_1"),
+            ("nome_respons_vel", "telefone_1"),
+            ("nome_responsavel", "telefone1"),
+            ("nome_respons_vel", "telefone1"),
+            ("nome_responsavel_2", "telefone_2"),
+            ("nome_respons_vel_2", "telefone_2"),
+            ("nome_responsavel_2", "telefone2"),
+            ("nome_respons_vel_2", "telefone2"),
+            ("nome_responsavel_3", "telefone_3"),
+            ("nome_respons_vel_3", "telefone_3"),
+            ("nome_responsavel_3", "telefone3"),
+            ("nome_respons_vel_3", "telefone3"),
+        ]
+
+        for name_column, phone_column in candidate_pairs:
+            if name_column in df.columns and phone_column in df.columns:
+                slots.append({"name": name_column, "phone": phone_column})
+
+        return slots
 
     @staticmethod
     def _build_contact_status(row: pd.Series) -> str:
