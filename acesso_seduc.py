@@ -105,7 +105,7 @@ async def run():
                 
                 # Filtrar
                 await page.get_by_role("button", name="Filtrar").click()
-                await asyncio.sleep(2)
+                await asyncio.sleep(5)
 
                 # Download Excel
                 print("Baixando Excel...")

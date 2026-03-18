@@ -16,3 +16,7 @@ class WhatsAppLinkBuilder:
         clean_phone = "".join(filter(str.isdigit, str(phone_number or "")))
         encoded_message = quote(message)
         return f"https://wa.me/{clean_phone}?text={encoded_message}"
+
+    def build_chat_link(self, phone_number: str) -> str:
+        clean_phone = "".join(filter(str.isdigit, str(phone_number or "")))
+        return f"https://wa.me/{clean_phone}"

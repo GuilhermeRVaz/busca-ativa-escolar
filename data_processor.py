@@ -1,11 +1,14 @@
 import logging
 import re
+import time
 import unicodedata
 from pathlib import Path
 from typing import Optional
 
 import gspread
+import openpyxl
 import pandas as pd
+from openpyxl.styles import Alignment
 
 from config import Settings, get_settings
 from whatsapp_bot import WhatsAppLinkBuilder
@@ -27,7 +30,7 @@ class ActiveSchoolSearchProcessor:
 
     def load_absence_report(self, report_path: Optional[Path] = None) -> pd.DataFrame:
         path = Path(report_path or self.settings.consolidated_report_path)
-        logger.info("Lendo relatório consolidado: %s", path)
+        logger.info("Lendo relatorio consolidado: %s", path)
 
         raw_df = pd.read_excel(path, header=None)
         header_row = self._find_absence_header_row(raw_df)
@@ -65,7 +68,6 @@ class ActiveSchoolSearchProcessor:
         prepared["total_absences"] = normalized_days.sum(axis=1).astype(int)
         prepared["absence_days_with_records"] = normalized_days.gt(0).sum(axis=1).astype(int)
 
-        # Extrai a lista de dias em que o aluno faltou (ex.: "3, 7, 15, 18")
         def _extract_absence_days(row: pd.Series) -> str:
             return ", ".join(
                 str(day)
@@ -76,10 +78,9 @@ class ActiveSchoolSearchProcessor:
         prepared["absence_days"] = normalized_days.apply(_extract_absence_days, axis=1)
 
         prepared = prepared[prepared["ra_key"].notna()].copy()
-        # Apenas alunos com 2 ou mais dias de falta (regra da busca ativa)
         prepared = prepared[prepared["absence_days_with_records"] >= 2].copy()
 
-        logger.info("Relatório processado com %s aluno(s) com ≥2 faltas.", len(prepared))
+        logger.info("Relatorio processado com %s aluno(s) com >=2 faltas.", len(prepared))
         return prepared
 
     def load_contacts_from_google_sheet(self) -> pd.DataFrame:
@@ -89,14 +90,12 @@ class ActiveSchoolSearchProcessor:
         credentials_file = self.settings.google_service_account_file
         if not credentials_file.exists():
             raise FileNotFoundError(
-                f"Arquivo de credenciais não encontrado: {credentials_file}",
+                f"Arquivo de credenciais nao encontrado: {credentials_file}",
             )
 
-        client = gspread.service_account(filename=str(credentials_file))
+        client = self._connect_gspread_with_retry(credentials_file)
         workbook = client.open_by_url(self.settings.google_sheet_url)
 
-        # Determina quais abas ler: usa GOOGLE_SHEET_WORKSHEET como lista separada
-        # por vírgula, ou lê TODAS as abas da planilha se o valor for "*" ou vazio.
         worksheet_setting = self.settings.google_sheet_worksheet.strip()
         if worksheet_setting and worksheet_setting != "*":
             tab_names = [t.strip() for t in worksheet_setting.split(",")]
@@ -112,34 +111,57 @@ class ActiveSchoolSearchProcessor:
                 records = worksheet.get_all_records()
                 if records:
                     df_tab = pd.DataFrame(records)
-                    df_tab["_tab"] = tab  # identifica a turma de origem
+                    df_tab["_tab"] = tab
                     all_records.append(df_tab)
                     logger.info("Aba '%s': %s registro(s).", tab, len(records))
                 else:
-                    logger.warning("Aba '%s' está vazia — ignorada.", tab)
+                    logger.warning("Aba '%s' esta vazia - ignorada.", tab)
             except Exception as exc:
-                logger.warning("Erro ao ler aba '%s': %s — ignorada.", tab, exc)
+                logger.warning("Erro ao ler aba '%s': %s - ignorada.", tab, exc)
 
         if not all_records:
-            raise ValueError("Nenhuma aba do Google Sheets continha dados válidos.")
+            raise ValueError("Nenhuma aba do Google Sheets continha dados validos.")
 
         contacts_df = pd.concat(all_records, ignore_index=True)
         logger.info("Total de contatos carregados: %s", len(contacts_df))
         return self.prepare_contacts_dataframe(contacts_df)
+
+    def _connect_gspread_with_retry(
+        self,
+        credentials_file: Path,
+        max_attempts: int = 3,
+    ) -> gspread.Client:
+        for attempt in range(1, max_attempts + 1):
+            try:
+                logger.info(
+                    "Conectando ao Google Sheets (tentativa %s/%s)...",
+                    attempt,
+                    max_attempts,
+                )
+                return gspread.service_account(filename=str(credentials_file))
+            except Exception as exc:
+                logger.warning("Falha na conexao com Google Sheets: %s", exc)
+                if attempt == max_attempts:
+                    raise
+
+                wait_time = attempt * 3
+                logger.info("Tentando novamente em %s segundos...", wait_time)
+                time.sleep(wait_time)
+
+        raise RuntimeError("Nao foi possivel conectar ao Google Sheets.")
 
     def prepare_contacts_dataframe(self, contacts_df: pd.DataFrame) -> pd.DataFrame:
         df = contacts_df.copy()
         renamed_columns = {column: self._normalize_column_name(column) for column in df.columns}
         df = df.rename(columns=renamed_columns)
 
-        # Filtra alunos transferidos (TRAN) ou com baixa (BXTR) — não devem receber contato
         situacao_column = self._pick_column(df, ["situacao"])
         if situacao_column:
-            _situacoes_excluidas = {"TRAN", "BXTR"}
-            mask_excluidos = df[situacao_column].astype(str).str.strip().str.upper().isin(_situacoes_excluidas)
+            situacoes_excluidas = {"TRAN", "BXTR"}
+            mask_excluidos = df[situacao_column].astype(str).str.strip().str.upper().isin(situacoes_excluidas)
             n_excluidos = mask_excluidos.sum()
             if n_excluidos:
-                logger.info("Excluindo %s aluno(s) com situação TRAN/BXTR.", n_excluidos)
+                logger.info("Excluindo %s aluno(s) com situacao TRAN/BXTR.", n_excluidos)
             df = df[~mask_excluidos].copy()
 
         ra_column = self._pick_column(df, ["ra"])
@@ -151,16 +173,16 @@ class ActiveSchoolSearchProcessor:
 
         if not ra_column:
             raise KeyError(
-                "A planilha precisa ter, no mínimo, a coluna RA.",
+                "A planilha precisa ter, no minimo, a coluna RA.",
             )
 
         contact_slots = self._extract_contact_slots(df)
         if not contact_slots:
             raise KeyError(
-                "A planilha precisa ter pelo menos uma combinação de nome do responsável e telefone.",
+                "A planilha precisa ter pelo menos uma combinacao de nome do responsavel e telefone.",
             )
 
-        prepared = pd.DataFrame()
+        prepared = pd.DataFrame(index=df.index)
         prepared["ra_base"] = df[ra_column].apply(self.extract_ra_base)
         prepared["ra_digit"] = (
             df[ra_digit_column].astype(str).str.strip().str.upper()
@@ -176,27 +198,47 @@ class ActiveSchoolSearchProcessor:
             if student_name_column
             else ""
         )
-        prepared["parent_name"] = ""
-        prepared["phone_raw"] = ""
-        prepared["phone_sanitized"] = ""
-        prepared["contact_slot"] = ""
+
+        for index in range(1, 4):
+            prepared[f"parent_name_{index}"] = ""
+            prepared[f"phone_raw_{index}"] = ""
+            prepared[f"phone_sanitized_{index}"] = ""
 
         for index, slot in enumerate(contact_slots, start=1):
-            slot_name_series = df[slot["name"]].fillna("").astype(str).str.strip()
-            slot_phone_series = df[slot["phone"]].fillna("").astype(str).str.strip()
-            slot_phone_clean = slot_phone_series.apply(self.sanitize_phone_number)
-            empty_phone_mask = prepared["phone_sanitized"].eq("") & slot_phone_clean.ne("")
+            if index > 3:
+                break
+            prepared[f"parent_name_{index}"] = df[slot["name"]].fillna("").astype(str).str.strip()
+            prepared[f"phone_raw_{index}"] = df[slot["phone"]].fillna("").astype(str).str.strip()
+            prepared[f"phone_sanitized_{index}"] = prepared[f"phone_raw_{index}"].apply(
+                self.sanitize_phone_number,
+            )
 
-            prepared.loc[empty_phone_mask, "parent_name"] = slot_name_series[empty_phone_mask]
-            prepared.loc[empty_phone_mask, "phone_raw"] = slot_phone_series[empty_phone_mask]
-            prepared.loc[empty_phone_mask, "phone_sanitized"] = slot_phone_clean[empty_phone_mask]
-            prepared.loc[empty_phone_mask, "contact_slot"] = f"responsavel_{index}"
+        def _first_non_empty(series: pd.Series) -> str:
+            for value in series:
+                if pd.notna(value):
+                    text = str(value).strip()
+                    if text:
+                        return text
+            return ""
 
-        prepared["parent_name"] = prepared["parent_name"].replace("", "Responsável")
+        aggregate_map: dict[str, object] = {
+            "ra_base": "first",
+            "ra_digit": "first",
+            "contact_student_name": _first_non_empty,
+        }
+        for index in range(1, 4):
+            aggregate_map[f"parent_name_{index}"] = _first_non_empty
+            aggregate_map[f"phone_raw_{index}"] = _first_non_empty
+            aggregate_map[f"phone_sanitized_{index}"] = _first_non_empty
+
+        prepared = prepared.dropna(subset=["ra_key"]).groupby("ra_key", as_index=False).agg(aggregate_map)
+        prepared["parent_name"] = prepared["parent_name_1"].replace("", "Responsavel")
+        prepared["phone_raw"] = prepared["phone_raw_1"]
+        prepared["phone_sanitized"] = prepared["phone_sanitized_1"]
+        prepared["contact_slot"] = "responsavel_1"
         prepared["contact_found"] = True
 
-        prepared = prepared.dropna(subset=["ra_key"]).drop_duplicates(subset=["ra_key"])
-        logger.info("Contatos válidos após limpeza: %s", len(prepared))
+        logger.info("Contatos validos apos limpeza: %s", len(prepared))
         return prepared
 
     def merge_absences_with_contacts(
@@ -211,9 +253,8 @@ class ActiveSchoolSearchProcessor:
             on="ra_key",
             suffixes=("", "_contact"),
         )
-        merged["parent_name"] = merged["parent_name"].fillna("Responsável")
+        merged["parent_name"] = merged["parent_name"].fillna("Responsavel")
         merged["phone_sanitized"] = merged["phone_sanitized"].fillna("")
-        # Garante coluna absence_days mesmo se vier vazia do relatório
         if "absence_days" not in merged.columns:
             merged["absence_days"] = ""
         merged["absence_days"] = merged["absence_days"].fillna("").astype(str)
@@ -227,10 +268,7 @@ class ActiveSchoolSearchProcessor:
             axis=1,
         )
         merged["whatsapp_link"] = merged.apply(
-            lambda row: self.link_builder.build_link(
-                row["phone_sanitized"],
-                row["whatsapp_message"],
-            )
+            lambda row: self.link_builder.build_chat_link(row["phone_sanitized"])
             if row["phone_sanitized"]
             else "",
             axis=1,
@@ -243,8 +281,72 @@ class ActiveSchoolSearchProcessor:
         output_path: Optional[Path] = None,
     ) -> Path:
         path = Path(output_path or self.settings.ready_to_send_output_path)
-        logger.info("Salvando planilha final: %s", path)
-        merged_df.to_excel(path, index=False)
+        logger.info("Salvando planilha final com multiplas abas: %s", path)
+
+        if "contact_slot" not in merged_df.columns:
+            logger.warning("Coluna 'contact_slot' nao encontrada. Salvando apenas aba unica.")
+            merged_df.to_excel(path, index=False)
+            return path
+
+        hidden_columns = {
+            "parent_name_2",
+            "phone_raw_2",
+            "phone_sanitized_2",
+            "parent_name_3",
+            "phone_raw_3",
+            "phone_sanitized_3",
+        }
+        output_columns = [column for column in merged_df.columns if column not in hidden_columns]
+        todos_df = merged_df[output_columns].copy()
+
+        def _build_contact_sheet(slot_index: int) -> pd.DataFrame:
+            parent_column = f"parent_name_{slot_index}"
+            phone_raw_column = f"phone_raw_{slot_index}"
+            phone_column = f"phone_sanitized_{slot_index}"
+            required_columns = {parent_column, phone_raw_column, phone_column}
+
+            if not required_columns.issubset(set(merged_df.columns)):
+                return pd.DataFrame(columns=output_columns)
+
+            slot_df = merged_df.copy()
+            slot_df["parent_name"] = slot_df[parent_column].fillna("").replace("", "Responsavel")
+            slot_df["phone_raw"] = slot_df[phone_raw_column].fillna("")
+            slot_df["phone_sanitized"] = slot_df[phone_column].fillna("")
+            slot_df["contact_slot"] = f"responsavel_{slot_index}"
+            slot_df["contact_status"] = slot_df.apply(self._build_contact_status, axis=1)
+            slot_df["whatsapp_message"] = slot_df.apply(
+                lambda row: self.link_builder.build_message(
+                    row["parent_name"],
+                    row["student_name"],
+                    row["absence_days"],
+                ),
+                axis=1,
+            )
+            slot_df["whatsapp_link"] = slot_df.apply(
+                lambda row: self.link_builder.build_chat_link(row["phone_sanitized"])
+                if row["phone_sanitized"]
+                else "",
+                axis=1,
+            )
+            return slot_df.loc[slot_df["phone_sanitized"].ne(""), output_columns].copy()
+
+        contato_2 = _build_contact_sheet(2)
+        contato_3 = _build_contact_sheet(3)
+
+        with pd.ExcelWriter(path, engine="openpyxl") as writer:
+            todos_df.to_excel(writer, sheet_name="Todos", index=False)
+
+            if not contato_2.empty:
+                contato_2.to_excel(writer, sheet_name="Contato_2", index=False)
+
+            if not contato_3.empty:
+                contato_3.to_excel(writer, sheet_name="Contato_3", index=False)
+
+        workbook = openpyxl.load_workbook(path)
+        for sheet_name in workbook.sheetnames:
+            self._format_whatsapp_columns(workbook[sheet_name])
+        workbook.save(path)
+
         return path
 
     def run(self) -> pd.DataFrame:
@@ -252,7 +354,7 @@ class ActiveSchoolSearchProcessor:
         contacts_df = self.load_contacts_from_google_sheet()
         merged_df = self.merge_absences_with_contacts(absence_df, contacts_df)
         self.export_ready_to_send(merged_df)
-        logger.info("Pipeline da Fase 2 concluído.")
+        logger.info("Pipeline da Fase 2 concluido.")
         return merged_df
 
     @staticmethod
@@ -261,7 +363,7 @@ class ActiveSchoolSearchProcessor:
             values = [str(value).strip().upper() for value in row.tolist() if pd.notna(value)]
             if {"N°", "NOME", "RA"}.issubset(set(values)):
                 return index
-        raise ValueError("Não foi possível localizar a linha de cabeçalho do relatório.")
+        raise ValueError("Nao foi possivel localizar a linha de cabecalho do relatorio.")
 
     @staticmethod
     def _absence_cell_to_int(value: object) -> int:
@@ -335,13 +437,10 @@ class ActiveSchoolSearchProcessor:
     def _extract_contact_slots(df: pd.DataFrame) -> list[dict[str, str]]:
         slots: list[dict[str, str]] = []
         candidate_pairs = [
-            # Padrão da planilha real: "responsavel 1" → "responsavel_1"
             ("responsavel_1", "telefone_1"),
             ("responsavel_2", "telefone_2"),
             ("responsavel_3", "telefone_3"),
-            # Variantes sem número (coluna única)
             ("responsavel", "telefone"),
-            # Padrões alternativos com prefixo "nome_"
             ("nome_responsavel", "telefone_1"),
             ("nome_respons_vel", "telefone_1"),
             ("nome_responsavel", "telefone1"),
@@ -365,10 +464,43 @@ class ActiveSchoolSearchProcessor:
     @staticmethod
     def _build_contact_status(row: pd.Series) -> str:
         if pd.isna(row.get("contact_found")):
-            return "RA não encontrado na planilha de contatos"
+            return "RA nao encontrado na planilha de contatos"
         if not row.get("phone_sanitized"):
-            return "Contato encontrado sem telefone válido"
+            return "Contato encontrado sem telefone valido"
         return "Pronto para envio"
+
+    @staticmethod
+    def _format_whatsapp_columns(worksheet: openpyxl.worksheet.worksheet.Worksheet) -> None:
+        header_map = {
+            str(cell.value).strip(): index
+            for index, cell in enumerate(worksheet[1], start=1)
+            if cell.value
+        }
+        message_column = header_map.get("whatsapp_message")
+        link_column = header_map.get("whatsapp_link")
+
+        if message_column:
+            worksheet.column_dimensions[
+                openpyxl.utils.get_column_letter(message_column)
+            ].width = 70
+            for row in range(2, worksheet.max_row + 1):
+                worksheet.cell(row=row, column=message_column).alignment = Alignment(
+                    wrap_text=True,
+                    vertical="top",
+                )
+
+        if link_column:
+            worksheet.column_dimensions[
+                openpyxl.utils.get_column_letter(link_column)
+            ].width = 18
+            for row in range(2, worksheet.max_row + 1):
+                cell = worksheet.cell(row=row, column=link_column)
+                url = str(cell.value or "").strip()
+                if not url:
+                    continue
+                cell.value = "Abrir WhatsApp"
+                cell.hyperlink = url
+                cell.style = "Hyperlink"
 
 
 if __name__ == "__main__":

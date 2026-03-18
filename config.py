@@ -22,6 +22,7 @@ class Settings:
     base_dir: Path
     consolidated_report_path: Path
     ready_to_send_output_path: Path
+    campaign_ledger_path: Path
     google_sheet_url: str
     google_sheet_worksheet: str
     google_service_account_file: Path
@@ -40,6 +41,10 @@ def get_settings() -> Settings:
         ready_to_send_output_path=_resolve_path(
             os.getenv("READY_TO_SEND_OUTPUT_PATH", ""),
             "relatorios/Ready_To_Send_List.xlsx",
+        ),
+        campaign_ledger_path=_resolve_path(
+            os.getenv("CAMPAIGN_LEDGER_PATH", ""),
+            "relatorios/Campaign_Ledger.xlsx",
         ),
         google_sheet_url=os.getenv("GOOGLE_SHEET_URL", "").strip(),
         google_sheet_worksheet=os.getenv("GOOGLE_SHEET_WORKSHEET", "Contatos").strip(),
