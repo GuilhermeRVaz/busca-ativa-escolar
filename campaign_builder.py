@@ -9,6 +9,7 @@ from typing import Optional
 import pandas as pd
 
 from config import Settings, get_settings
+from message_catalog import MessageCatalog
 
 
 logging.basicConfig(
@@ -32,6 +33,7 @@ CAMPAIGN_COLUMNS = [
     "parent_name",
     "phone_sanitized",
     "absence_days",
+    "message_template_id",
     "whatsapp_message",
     "contact_slot",
 ]
@@ -53,6 +55,7 @@ class CampaignBuildResult:
 class CampaignBuilder:
     def __init__(self, settings: Optional[Settings] = None) -> None:
         self.settings = settings or get_settings()
+        self.message_catalog = MessageCatalog()
 
     def build_campaign(
         self,
@@ -182,7 +185,6 @@ class CampaignBuilder:
                 "parent_name",
                 "phone_sanitized",
                 "absence_days",
-                "whatsapp_message",
                 "contact_slot",
             ]
         ].copy()
@@ -197,6 +199,18 @@ class CampaignBuilder:
                 "Removendo %s registro(s) duplicado(s) na montagem da campanha.",
                 duplicate_count,
             )
+        template_details = campaign_df.apply(
+            lambda row: self.message_catalog.build_message(
+                parent_name=str(row["parent_name"]),
+                student_name=str(row["student_name"]),
+                absence_days=str(row["absence_days"]),
+                campaign_id=campaign_id,
+                unique_key=f"{row['ra_key']}|{row['phone_sanitized']}|{row['contact_slot']}",
+            ),
+            axis=1,
+        )
+        campaign_df["message_template_id"] = template_details.apply(lambda value: value[0])
+        campaign_df["whatsapp_message"] = template_details.apply(lambda value: value[1])
         campaign_df.insert(0, "observacao", "")
         campaign_df.insert(0, "status_resposta", RESPONSE_STATUS_PENDING)
         campaign_df.insert(0, "data_envio", "")
