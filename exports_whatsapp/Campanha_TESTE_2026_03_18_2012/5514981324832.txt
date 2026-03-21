@@ -1,0 +1,3 @@
+﻿18/03/2026, 20:16 - Escola Decia: Ola Guilherme, esta e uma mensagem de teste controlado da automacao da Escola Decia para validar o envio via Playwright. Referencia de teste: burro, dias 9, 18. Nenhuma acao e necessaria.
+18/03/2026, 20:20 - Guilherme: Recebido, obrigado.
+18/03/2026, 20:22 - Guilherme: Ele faltou porque estava doente.

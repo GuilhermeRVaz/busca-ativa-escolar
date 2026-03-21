@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_CAMPAIGN_PATH = Path("relatorios/Campanha_TESTE.xlsx")
 DEFAULT_TEST_SESSION_DIR = Path("user_data/whatsapp_sender_session_test")
 DEFAULT_REAL_SESSION_DIR = Path("user_data/whatsapp_sender_session_real")
+DEFAULT_DAILY_LEDGER_PATH = Path("relatorios/Daily_Campaign_Ledger.xlsx")
 REQUIRED_COLUMNS = [
     "campaign_id",
     "status_envio",
@@ -40,6 +41,10 @@ REQUIRED_COLUMNS = [
     "whatsapp_message",
     "contact_slot",
 ]
+
+
+class InvalidNumberError(RuntimeError):
+    """Raised when WhatsApp indicates that a phone number is unavailable."""
 
 
 class PlaywrightSender:
@@ -135,7 +140,7 @@ class PlaywrightSender:
                             "Enviado via playwright_sender.",
                         )
                         sent_count += 1
-                        self._save_campaign(campaign_df)
+                        self._persist_campaign_state(campaign_df)
                         logger.info(
                             "Envio concluido | linha=%s | aluno=%s",
                             index,
@@ -150,6 +155,21 @@ class PlaywrightSender:
                             batch_break_min_seconds=batch_break_min_seconds,
                             batch_break_max_seconds=batch_break_max_seconds,
                         )
+                    except InvalidNumberError as exc:
+                        campaign_df.at[index, "status_envio"] = "falha"
+                        campaign_df.at[index, "status_resposta"] = "numero_invalido"
+                        campaign_df.at[index, "observacao"] = self._append_observation(
+                            campaign_df.at[index, "observacao"],
+                            f"Numero invalido ou ausente no WhatsApp: {exc}",
+                        )
+                        self._persist_campaign_state(campaign_df)
+                        logger.warning(
+                            "Numero nao encontrado no WhatsApp | linha=%s | aluno=%s | telefone=%s",
+                            index,
+                            row["student_name"],
+                            row["phone_sanitized"],
+                        )
+                        continue
                     except Exception as exc:
                         campaign_df.at[index, "status_envio"] = "falha"
                         if "invalido" in str(exc).lower():
@@ -158,7 +178,7 @@ class PlaywrightSender:
                             campaign_df.at[index, "observacao"],
                             f"Falha no envio: {exc}",
                         )
-                        self._save_campaign(campaign_df)
+                        self._persist_campaign_state(campaign_df)
                         logger.exception(
                             "Falha no envio | linha=%s | aluno=%s | erro=%s",
                             index,
@@ -212,8 +232,8 @@ class PlaywrightSender:
         logger.info("Abrindo conversa para %s", phone)
         page.goto(url, wait_until="domcontentloaded")
 
-        if self._has_invalid_number_message(page):
-            raise ValueError("Numero invalido ou nao localizado pelo WhatsApp.")
+        if self._handle_invalid_number_modal(page):
+            raise InvalidNumberError("Numero invalido ou nao localizado pelo WhatsApp.")
 
         message_box = self._wait_for_message_box(page)
         message_box.click()
@@ -260,12 +280,16 @@ class PlaywrightSender:
         ]
         last_error = None
         for selector in selectors:
+            if PlaywrightSender._handle_invalid_number_modal(page):
+                raise InvalidNumberError("Numero invalido ou nao localizado pelo WhatsApp.")
             try:
                 locator = page.locator(selector).last
                 locator.wait_for(state="visible", timeout=25000)
                 return locator
             except PlaywrightTimeoutError as exc:
                 last_error = exc
+        if PlaywrightSender._handle_invalid_number_modal(page):
+            raise InvalidNumberError("Numero invalido ou nao localizado pelo WhatsApp.")
         raise RuntimeError("Nao foi possivel localizar a caixa de mensagem.") from last_error
 
     @staticmethod
@@ -293,7 +317,7 @@ class PlaywrightSender:
 
     def _sync_campaign_to_ledger(self, campaign_df: pd.DataFrame) -> None:
         settings = get_settings()
-        ledger_path = settings.campaign_ledger_path
+        ledger_path = self._resolve_ledger_path(settings)
         if not ledger_path.exists():
             logger.warning("Campaign ledger nao encontrado em %s. Sincronizacao ignorada.", ledger_path)
             return
@@ -449,6 +473,64 @@ class PlaywrightSender:
     def _build_merge_key(row: pd.Series, key_columns: list[str]) -> str:
         parts = [PlaywrightSender._safe_text(row.get(column)) for column in key_columns]
         return "|".join(parts)
+
+    def _resolve_ledger_path(self, settings) -> Path:
+        if self.campaign_path.stem.lower().startswith("campanha_diaria_"):
+            return DEFAULT_DAILY_LEDGER_PATH
+        return settings.campaign_ledger_path
+
+    @staticmethod
+    def _has_invalid_number_message(page) -> bool:
+        invalid_markers = [
+            "numero de telefone compartilhado por url e invalido",
+            "phone number shared via url is invalid",
+            "nao esta no whatsapp",
+            "não está no whatsapp",
+            "nao está no whatsapp",
+            "não esta no whatsapp",
+            "nÃ£o foi encontrado",
+            "nao foi encontrado",
+            "não foi encontrado",
+        ]
+        body_text = page.locator("body").inner_text(timeout=5000).lower()
+        return any(marker in body_text for marker in invalid_markers)
+
+    @staticmethod
+    def _handle_invalid_number_modal(page) -> bool:
+        try:
+            if not PlaywrightSender._has_invalid_number_message(page):
+                return False
+        except Exception:
+            return False
+
+        ok_candidates = [
+            page.get_by_role("button", name="OK"),
+            page.locator("button").filter(has_text=re.compile(r"^OK$", re.IGNORECASE)),
+            page.locator("[role='button']").filter(has_text=re.compile(r"^OK$", re.IGNORECASE)),
+        ]
+        for locator in ok_candidates:
+            try:
+                locator.first.click(timeout=2000)
+                time.sleep(1.0)
+                return True
+            except Exception:
+                continue
+        return True
+
+    def _persist_campaign_state(self, df: pd.DataFrame) -> None:
+        try:
+            self._save_campaign(df)
+        except PermissionError:
+            autosave_path = self.campaign_path.with_name(
+                f"{self.campaign_path.stem}.runtime_autosave{self.campaign_path.suffix}",
+            )
+            with pd.ExcelWriter(autosave_path, engine="openpyxl") as writer:
+                df.to_excel(writer, sheet_name="Campanha", index=False)
+            logger.warning(
+                "Nao foi possivel salvar a campanha principal porque ela esta aberta no Excel. "
+                "Estado salvo em %s. Feche a planilha antes da proxima execucao.",
+                autosave_path,
+            )
 
 
 def main() -> None:
