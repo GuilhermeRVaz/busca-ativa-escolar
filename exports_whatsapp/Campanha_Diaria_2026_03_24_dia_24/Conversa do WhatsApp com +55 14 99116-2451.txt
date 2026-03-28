@@ -1,0 +1,5 @@
+20/03/2026 13:59 - As mensagens e ligações são protegidas com a criptografia de ponta a ponta. Somente as pessoas que fazem parte da conversa podem ler, ouvir e compartilhar esse conteúdo. *Saiba mais*
+20/03/2026 13:57 - Escola Décia L M dos Santos: Ola mãe, aqui e da Escola Decia. O(a) aluno(a) SOPHIA RAYANE DE CARVALHO esteve ausente nos dias 19. Poderia nos informar o motivo ou entrar em contato com a escola?
+20/03/2026 14:03 - +55 14 99116-2451: Oi Sophia está muito ruim da gripe
+20/03/2026 14:37 - Escola Décia L M dos Santos: boa tarde, estamos implementando e testando um sistema automático para busca ativa dos alunos que faltaram, agradeço seu retorno. a Justificativa nos ajuda a entender os motivos de faltas dos alunos para lutar contra a evasão escolar.
+24/03/2026 09:36 - Escola Décia L M dos Santos: mãe, informamos que o(a) aluno(a) SOPHIA RAYANE DE CARVALHO apresentou faltas nos dias 24. Favor justificar junto a Escola Decia.

@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 
 CAMPAIGN_COLUMNS = [
+    "campaign_row_id",
     "campaign_id",
     "data_criacao",
     "status_envio",
@@ -36,6 +37,12 @@ CAMPAIGN_COLUMNS = [
     "message_template_id",
     "whatsapp_message",
     "contact_slot",
+    "parent_name_2",
+    "phone_sanitized_2",
+    "contact_slot_2",
+    "parent_name_3",
+    "phone_sanitized_3",
+    "contact_slot_3",
 ]
 
 RESPONSE_STATUS_RESPONDED = "respondido"
@@ -55,7 +62,7 @@ class CampaignBuildResult:
 class CampaignBuilder:
     def __init__(self, settings: Optional[Settings] = None) -> None:
         self.settings = settings or get_settings()
-        self.message_catalog = MessageCatalog()
+        self.message_catalog = MessageCatalog(school_name=self.settings.school_name)
 
     def build_campaign(
         self,
@@ -203,6 +210,7 @@ class CampaignBuilder:
             lambda row: self.message_catalog.build_message(
                 parent_name=str(row["parent_name"]),
                 student_name=str(row["student_name"]),
+                class_name=str(row["class_name"]),
                 absence_days=str(row["absence_days"]),
                 campaign_id=campaign_id,
                 unique_key=f"{row['ra_key']}|{row['phone_sanitized']}|{row['contact_slot']}",
@@ -211,12 +219,23 @@ class CampaignBuilder:
         )
         campaign_df["message_template_id"] = template_details.apply(lambda value: value[0])
         campaign_df["whatsapp_message"] = template_details.apply(lambda value: value[1])
+        campaign_df.insert(
+            0,
+            "campaign_row_id",
+            campaign_df.apply(
+                lambda row: f"{campaign_id}|{row['ra_key']}|{row['phone_sanitized']}|{row['contact_slot']}",
+                axis=1,
+            ),
+        )
         campaign_df.insert(0, "observacao", "")
         campaign_df.insert(0, "status_resposta", RESPONSE_STATUS_PENDING)
         campaign_df.insert(0, "data_envio", "")
         campaign_df.insert(0, "status_envio", SEND_STATUS_PENDING)
         campaign_df.insert(0, "data_criacao", created_at.strftime("%Y-%m-%d %H:%M:%S"))
         campaign_df.insert(0, "campaign_id", campaign_id)
+        for column in CAMPAIGN_COLUMNS:
+            if column not in campaign_df.columns:
+                campaign_df[column] = ""
         return campaign_df[CAMPAIGN_COLUMNS]
 
     def _write_campaign_file(self, df: pd.DataFrame, path: Path) -> None:
@@ -233,7 +252,7 @@ class CampaignBuilder:
             return ledger_df.copy()
 
         combined = pd.concat([ledger_df, campaign_df], ignore_index=True)
-        dedup_keys = ["campaign_id", "ra_key", "phone_sanitized", "contact_slot"]
+        dedup_keys = ["campaign_row_id"] if "campaign_row_id" in combined.columns else ["campaign_id", "ra_key", "phone_sanitized", "contact_slot"]
         combined = combined.drop_duplicates(subset=dedup_keys, keep="first")
         return combined[CAMPAIGN_COLUMNS].copy()
 

@@ -1,6 +1,5 @@
 import argparse
 import logging
-import re
 from pathlib import Path
 
 import pandas as pd
@@ -16,6 +15,7 @@ logger = logging.getLogger(__name__)
 
 
 DEFAULT_DAILY_LEDGER_PATH = Path("relatorios/Daily_Campaign_Ledger.xlsx")
+NON_RESPONSE_STATUSES = {"", "sem_resposta", "numero_invalido", "pendente"}
 
 
 class ResponseReportBuilder:
@@ -28,12 +28,12 @@ class ResponseReportBuilder:
         campaign_df = self._load_campaign()
         campaign_id = self._resolve_campaign_id(campaign_df)
         responses_path = self._resolve_responses_path(campaign_id)
-        responses_df = self._load_responses(responses_path)
+        matches_df, messages_df, files_df = self._load_responses(responses_path)
         ledger_df = self._load_ledger()
 
         enriched_campaign_df = self._prepare_campaign(campaign_df, ledger_df)
-        matched_messages_df = self._prepare_messages(responses_df)
-        report_parts = self._build_report_parts(enriched_campaign_df, matched_messages_df)
+        prepared_matches_df = self._prepare_matches(matches_df)
+        report_parts = self._build_report_parts(enriched_campaign_df, prepared_matches_df, messages_df, files_df)
 
         report_path = Path(
             output_path or self.campaign_path.parent / f"Relatorio_de_Retornos_{campaign_id}.xlsx",
@@ -59,10 +59,16 @@ class ResponseReportBuilder:
             return self.responses_path
         return self.campaign_path.parent / f"WhatsApp_Responses_Normalized_{campaign_id}.xlsx"
 
-    def _load_responses(self, path: Path) -> pd.DataFrame:
+    def _load_responses(self, path: Path) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         if not path.exists():
             raise FileNotFoundError(f"Base normalizada de respostas nao encontrada: {path}")
-        return pd.read_excel(path, sheet_name="Messages")
+
+        excel_file = pd.ExcelFile(path)
+        sheet_names = set(excel_file.sheet_names)
+        matches_df = pd.read_excel(path, sheet_name="Matches") if "Matches" in sheet_names else pd.DataFrame()
+        messages_df = pd.read_excel(path, sheet_name="Messages") if "Messages" in sheet_names else pd.DataFrame()
+        files_df = pd.read_excel(path, sheet_name="Files") if "Files" in sheet_names else pd.DataFrame()
+        return matches_df, messages_df, files_df
 
     def _load_ledger(self) -> pd.DataFrame:
         ledger_path = self._resolve_ledger_path()
@@ -78,14 +84,26 @@ class ResponseReportBuilder:
 
     def _prepare_campaign(self, campaign_df: pd.DataFrame, ledger_df: pd.DataFrame) -> pd.DataFrame:
         prepared = campaign_df.copy()
-        for column in ["student_name", "parent_name", "phone_sanitized", "ra_key", "contact_slot"]:
-            prepared[column] = prepared[column].apply(self._safe_text)
-        for column in ["status_envio", "status_resposta", "observacao", "whatsapp_message"]:
+        for column in [
+            "campaign_id",
+            "class_name",
+            "student_name",
+            "parent_name",
+            "phone_sanitized",
+            "ra_key",
+            "contact_slot",
+            "status_envio",
+            "status_resposta",
+            "observacao",
+            "whatsapp_message",
+        ]:
             if column in prepared.columns:
                 prepared[column] = prepared[column].apply(self._safe_text)
-        prepared["data_envio_dt"] = pd.to_datetime(prepared["data_envio"], errors="coerce")
+
+        prepared["phone_sanitized"] = prepared["phone_sanitized"].map(self._digits_only)
+        prepared["data_envio_dt"] = pd.to_datetime(prepared.get("data_envio"), errors="coerce")
         prepared["campaign_key"] = prepared.apply(self._build_campaign_key, axis=1)
-        prepared["whatsapp_message_norm"] = prepared["whatsapp_message"].map(self._normalize_text)
+        prepared["status_resposta_norm"] = prepared["status_resposta"].map(self._normalize_status)
 
         if ledger_df.empty:
             prepared["ledger_status_resposta"] = ""
@@ -96,6 +114,7 @@ class ResponseReportBuilder:
         for column in ["ra_key", "phone_sanitized", "contact_slot", "status_resposta", "observacao"]:
             if column in ledger_prepared.columns:
                 ledger_prepared[column] = ledger_prepared[column].apply(self._safe_text)
+        ledger_prepared["phone_sanitized"] = ledger_prepared["phone_sanitized"].map(self._digits_only)
         ledger_prepared["campaign_key"] = ledger_prepared.apply(self._build_campaign_key, axis=1)
         ledger_trimmed = ledger_prepared[["campaign_key", "status_resposta", "observacao"]].drop_duplicates(
             subset=["campaign_key"],
@@ -112,98 +131,136 @@ class ResponseReportBuilder:
             how="left",
         )
 
-    def _prepare_messages(self, responses_df: pd.DataFrame) -> pd.DataFrame:
-        prepared = responses_df.copy()
+    def _prepare_matches(self, matches_df: pd.DataFrame) -> pd.DataFrame:
+        if matches_df.empty:
+            return pd.DataFrame(columns=["campaign_key"])
+
+        prepared = matches_df.copy()
         for column in [
-            "matched_ra_key",
+            "campaign_id",
+            "campaign_key",
+            "source_file",
+            "source_file_path",
+            "conversation_id",
+            "conversation_header",
+            "match_method",
+            "matched_student_name",
+            "matched_parent_name",
             "matched_phone",
             "matched_contact_slot",
-            "matched_parent_name",
-            "matched_student_name",
-            "author_label",
-            "message_text",
+            "matched_ra_key",
+            "campaign_prompt_text",
+            "campaign_prompt_author",
+            "first_reply_author",
+            "first_reply_text",
+            "reason_category_suggested",
+            "reason_text_excerpt",
+            "review_reason",
         ]:
             if column in prepared.columns:
                 prepared[column] = prepared[column].apply(self._safe_text)
-        prepared["message_datetime_dt"] = pd.to_datetime(prepared["message_datetime"], errors="coerce")
-        prepared["campaign_key"] = prepared.apply(
-            lambda row: self._join_key(
-                row.get("matched_ra_key"),
-                row.get("matched_phone"),
-                row.get("matched_contact_slot"),
-            ),
-            axis=1,
+
+        prepared["matched_phone"] = prepared["matched_phone"].map(self._digits_only)
+        prepared["first_reply_after_send_dt"] = pd.to_datetime(
+            prepared.get("first_reply_after_send_datetime"),
+            errors="coerce",
         )
-        prepared["message_text_norm"] = prepared["message_text"].map(self._normalize_text)
-        prepared["matched"] = prepared["matched"].fillna(False).astype(bool)
-        prepared = prepared.loc[prepared["matched"]].copy()
+        prepared["campaign_prompt_dt"] = pd.to_datetime(prepared.get("campaign_prompt_datetime"), errors="coerce")
+        prepared["has_campaign_prompt"] = prepared.get("has_campaign_prompt", False).fillna(False).astype(bool)
+        prepared["needs_review"] = prepared.get("needs_review", False).fillna(False).astype(bool)
+        prepared["respondeu_por_parser"] = prepared["first_reply_after_send_dt"].notna()
         return prepared
 
     def _build_report_parts(
         self,
         campaign_df: pd.DataFrame,
+        matches_df: pd.DataFrame,
         messages_df: pd.DataFrame,
+        files_df: pd.DataFrame,
     ) -> dict[str, pd.DataFrame]:
-        sent_df = campaign_df.loc[campaign_df["status_envio"].str.lower().eq("enviado")].copy()
-        responded_rows: list[dict[str, object]] = []
-        incoming_rows: list[dict[str, object]] = []
+        matches_summary = self._summarize_matches(matches_df)
+        report_df = campaign_df.merge(matches_summary, on="campaign_key", how="left")
+        report_df = report_df.fillna(
+            {
+                "match_method": "",
+                "source_file": "",
+                "source_file_path": "",
+                "conversation_id": "",
+                "campaign_prompt_datetime": "",
+                "first_reply_after_send_datetime": "",
+                "first_reply_author": "",
+                "first_reply_text": "",
+                "reason_category_suggested": "",
+                "reason_text_excerpt": "",
+                "review_reason": "",
+                "respondeu_por_parser": False,
+                "has_campaign_prompt": False,
+                "needs_review": False,
+                "reply_count_after_send": 0,
+            }
+        )
 
-        for _, campaign_row in sent_df.iterrows():
-            candidate_messages = messages_df.loc[
-                messages_df["campaign_key"].eq(campaign_row["campaign_key"])
-                & messages_df["message_datetime_dt"].notna()
-            ].copy()
-            if pd.notna(campaign_row["data_envio_dt"]):
-                candidate_messages = candidate_messages.loc[
-                    candidate_messages["message_datetime_dt"] >= campaign_row["data_envio_dt"]
-                ]
-            candidate_messages = candidate_messages.sort_values("message_datetime_dt")
-            incoming_messages = candidate_messages.loc[
-                candidate_messages["message_text_norm"].ne(campaign_row["whatsapp_message_norm"])
-            ].copy()
-            if incoming_messages.empty:
-                continue
+        report_df["ledger_status_resposta"] = report_df.get("ledger_status_resposta", "").fillna("")
+        report_df["ledger_observacao"] = report_df.get("ledger_observacao", "").fillna("")
+        report_df["respondeu_por_ledger"] = report_df.apply(self._detect_ledger_response, axis=1)
+        report_df["respondeu_final"] = report_df["respondeu_por_parser"] | report_df["respondeu_por_ledger"]
+        report_df["status_numero_invalido"] = report_df["status_resposta_norm"].eq("numero_invalido")
+        report_df["review_reason"] = report_df["review_reason"].fillna("").astype(str)
+        report_df.loc[
+            report_df["respondeu_por_parser"] != report_df["respondeu_por_ledger"],
+            "review_reason",
+        ] = report_df.loc[
+            report_df["respondeu_por_parser"] != report_df["respondeu_por_ledger"],
+            "review_reason",
+        ].map(lambda value: self._append_reason(value, "divergencia_parser_ledger"))
+        report_df.loc[
+            report_df["status_envio"].str.lower().eq("enviado") & report_df["match_method"].fillna("").eq(""),
+            "review_reason",
+        ] = report_df.loc[
+            report_df["status_envio"].str.lower().eq("enviado") & report_df["match_method"].fillna("").eq(""),
+            "review_reason",
+        ].map(lambda value: self._append_reason(value, "sem_match_de_conversa"))
+        report_df["revisar_final"] = report_df["needs_review"] | (
+            report_df["respondeu_por_parser"] != report_df["respondeu_por_ledger"]
+        ) | report_df["match_method"].fillna("").eq("")
 
-            first_response = incoming_messages.iloc[0]
-            responded_rows.append(
-                {
-                    "campaign_id": campaign_row["campaign_id"],
-                    "class_name": campaign_row["class_name"],
-                    "student_name": campaign_row["student_name"],
-                    "parent_name": campaign_row["parent_name"],
-                    "phone_sanitized": campaign_row["phone_sanitized"],
-                    "data_envio": self._safe_text(campaign_row["data_envio"]),
-                    "data_primeira_resposta": self._safe_text(first_response["message_datetime"]),
-                    "autor_primeira_resposta": self._safe_text(first_response["author_label"]),
-                    "texto_primeira_resposta": self._safe_text(first_response["message_text"]),
-                    "total_mensagens_recebidas": len(incoming_messages),
-                    "status_envio": self._safe_text(campaign_row["status_envio"]),
-                    "status_resposta_campanha": self._safe_text(campaign_row.get("status_resposta")),
-                    "status_resposta_ledger": self._safe_text(campaign_row.get("ledger_status_resposta")),
-                    "observacao": self._safe_text(campaign_row.get("observacao")),
-                }
-            )
-            for _, message_row in incoming_messages.iterrows():
-                incoming_rows.append(
-                    {
-                        "campaign_id": campaign_row["campaign_id"],
-                        "class_name": campaign_row["class_name"],
-                        "student_name": campaign_row["student_name"],
-                        "parent_name": campaign_row["parent_name"],
-                        "phone_sanitized": campaign_row["phone_sanitized"],
-                        "message_datetime": self._safe_text(message_row["message_datetime"]),
-                        "author_label": self._safe_text(message_row["author_label"]),
-                        "message_text": self._safe_text(message_row["message_text"]),
-                        "source_file": self._safe_text(message_row["source_file"]),
-                    }
-                )
+        common_columns = [
+            "campaign_id",
+            "class_name",
+            "student_name",
+            "parent_name",
+            "phone_sanitized",
+            "data_envio",
+            "status_envio",
+            "status_resposta",
+            "ledger_status_resposta",
+            "respondeu_por_parser",
+            "respondeu_por_ledger",
+            "respondeu_final",
+            "match_method",
+            "source_file",
+            "source_file_path",
+            "campaign_prompt_datetime",
+            "first_reply_after_send_datetime",
+            "first_reply_author",
+            "first_reply_text",
+            "reason_category_suggested",
+            "reason_text_excerpt",
+            "review_reason",
+            "observacao",
+            "ledger_observacao",
+        ]
 
-        responded_df = pd.DataFrame(responded_rows)
-        incoming_df = pd.DataFrame(incoming_rows)
-        responded_keys = set(responded_df["phone_sanitized"]) if not responded_df.empty else set()
+        responded_df = report_df.loc[report_df["respondeu_final"]].copy()[common_columns]
+        sem_retorno_df = report_df.loc[
+            report_df["status_envio"].str.lower().eq("enviado")
+            & ~report_df["respondeu_final"]
+            & ~report_df["status_numero_invalido"]
+        ].copy()[common_columns]
 
-        sem_retorno_df = sent_df.loc[~sent_df["phone_sanitized"].isin(responded_keys)].copy()
-        sem_retorno_df = sem_retorno_df[
+        nao_recontatar_df = report_df.loc[
+            report_df["respondeu_final"] | report_df["status_numero_invalido"]
+        ].copy()[
             [
                 "campaign_id",
                 "class_name",
@@ -213,11 +270,13 @@ class ResponseReportBuilder:
                 "data_envio",
                 "status_envio",
                 "status_resposta",
-                "observacao",
+                "respondeu_final",
+                "reason_category_suggested",
+                "source_file_path",
             ]
         ]
 
-        nao_recontatar_df = responded_df[
+        justificativas_df = report_df.loc[report_df["first_reply_text"].fillna("").astype(str).str.strip().ne("")].copy()[
             [
                 "campaign_id",
                 "class_name",
@@ -225,40 +284,67 @@ class ResponseReportBuilder:
                 "parent_name",
                 "phone_sanitized",
                 "data_envio",
-                "data_primeira_resposta",
-                "texto_primeira_resposta",
+                "first_reply_after_send_datetime",
+                "first_reply_author",
+                "first_reply_text",
+                "reason_category_suggested",
+                "reason_text_excerpt",
+                "source_file",
+                "source_file_path",
+                "review_reason",
             ]
-        ] if not responded_df.empty else pd.DataFrame(
-            columns=[
+        ]
+
+        revisar_df = report_df.loc[report_df["revisar_final"]].copy()[
+            [
                 "campaign_id",
                 "class_name",
                 "student_name",
                 "parent_name",
                 "phone_sanitized",
                 "data_envio",
-                "data_primeira_resposta",
-                "texto_primeira_resposta",
+                "status_envio",
+                "status_resposta",
+                "ledger_status_resposta",
+                "respondeu_por_parser",
+                "respondeu_por_ledger",
+                "respondeu_final",
+                "match_method",
+                "source_file",
+                "source_file_path",
+                "campaign_prompt_datetime",
+                "first_reply_after_send_datetime",
+                "first_reply_text",
+                "reason_category_suggested",
+                "review_reason",
+                "observacao",
+                "ledger_observacao",
             ]
-        )
+        ]
 
-        justificativas_df = incoming_df.copy()
-
-        total_enviados = len(sent_df)
-        total_respondidos = len(responded_df)
+        total_enviados = int(report_df["status_envio"].str.lower().eq("enviado").sum())
+        total_respondidos_parser = int(report_df["respondeu_por_parser"].sum())
+        total_respondidos_ledger = int(report_df["respondeu_por_ledger"].sum())
+        total_respondidos_final = int(report_df["respondeu_final"].sum())
         total_sem_retorno = len(sem_retorno_df)
-        taxa_resposta = round((total_respondidos / total_enviados) * 100, 2) if total_enviados else 0.0
-        total_numero_invalido = int(
-            campaign_df["status_resposta"].fillna("").astype(str).str.lower().eq("numero_invalido").sum()
-        )
+        total_numero_invalido = int(report_df["status_numero_invalido"].sum())
+        total_revisar = len(revisar_df)
+        taxa_resposta = round((total_respondidos_final / total_enviados) * 100, 2) if total_enviados else 0.0
 
         resumo_df = pd.DataFrame(
             [
                 {"indicador": "campaign_id", "valor": self._resolve_campaign_id(campaign_df)},
+                {"indicador": "total_registros_campanha", "valor": len(report_df)},
                 {"indicador": "total_enviados", "valor": total_enviados},
-                {"indicador": "total_respondidos", "valor": total_respondidos},
+                {"indicador": "total_respondidos_parser", "valor": total_respondidos_parser},
+                {"indicador": "total_respondidos_ledger", "valor": total_respondidos_ledger},
+                {"indicador": "total_respondidos_final", "valor": total_respondidos_final},
                 {"indicador": "total_sem_retorno", "valor": total_sem_retorno},
                 {"indicador": "total_numero_invalido", "valor": total_numero_invalido},
+                {"indicador": "total_para_revisar", "valor": total_revisar},
                 {"indicador": "taxa_resposta_percentual", "valor": taxa_resposta},
+                {"indicador": "total_arquivos_importados", "valor": len(files_df) if not files_df.empty else 0},
+                {"indicador": "total_mensagens_importadas", "valor": len(messages_df) if not messages_df.empty else 0},
             ]
         )
 
@@ -268,80 +354,132 @@ class ResponseReportBuilder:
             "Sem_Retorno": sem_retorno_df,
             "Nao_Recontatar": nao_recontatar_df,
             "Justificativas": justificativas_df,
+            "Revisar": revisar_df,
         }
 
-    @staticmethod
-    def _write_report(parts: dict[str, pd.DataFrame], output_path: Path) -> None:
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-            for sheet_name, df in parts.items():
-                export_df = df if not df.empty else pd.DataFrame()
-                export_df.to_excel(writer, sheet_name=sheet_name, index=False)
+    def _summarize_matches(self, matches_df: pd.DataFrame) -> pd.DataFrame:
+        if matches_df.empty:
+            return pd.DataFrame(
+                columns=[
+                    "campaign_key",
+                    "match_method",
+                    "source_file",
+                    "source_file_path",
+                    "conversation_id",
+                    "campaign_prompt_datetime",
+                    "first_reply_after_send_datetime",
+                    "first_reply_author",
+                    "first_reply_text",
+                    "reason_category_suggested",
+                    "reason_text_excerpt",
+                    "review_reason",
+                    "respondeu_por_parser",
+                    "has_campaign_prompt",
+                    "needs_review",
+                    "reply_count_after_send",
+                ]
+            )
 
-    @staticmethod
-    def _build_campaign_key(row: pd.Series) -> str:
-        return ResponseReportBuilder._join_key(
-            row.get("ra_key"),
-            row.get("phone_sanitized"),
-            row.get("contact_slot"),
-        )
+        summary_rows: list[dict[str, object]] = []
+        for campaign_key, group_df in matches_df.groupby("campaign_key", dropna=False):
+            ordered = group_df.sort_values(
+                ["respondeu_por_parser", "campaign_prompt_dt", "first_reply_after_send_dt"],
+                ascending=[False, True, True],
+                na_position="last",
+            )
+            best = ordered.iloc[0]
+            review_reasons = " | ".join(
+                sorted({self._safe_text(value) for value in group_df["review_reason"] if self._safe_text(value)})
+            )
+            summary_rows.append(
+                {
+                    "campaign_key": campaign_key,
+                    "match_method": self._safe_text(best.get("match_method")),
+                    "source_file": self._safe_text(best.get("source_file")),
+                    "source_file_path": self._safe_text(best.get("source_file_path")),
+                    "conversation_id": self._safe_text(best.get("conversation_id")),
+                    "campaign_prompt_datetime": self._safe_text(best.get("campaign_prompt_datetime")),
+                    "first_reply_after_send_datetime": self._safe_text(best.get("first_reply_after_send_datetime")),
+                    "first_reply_author": self._safe_text(best.get("first_reply_author")),
+                    "first_reply_text": self._safe_text(best.get("first_reply_text")),
+                    "reason_category_suggested": self._safe_text(best.get("reason_category_suggested")),
+                    "reason_text_excerpt": self._safe_text(best.get("reason_text_excerpt")),
+                    "review_reason": review_reasons,
+                    "respondeu_por_parser": bool(group_df["respondeu_por_parser"].any()),
+                    "has_campaign_prompt": bool(group_df["has_campaign_prompt"].any()),
+                    "needs_review": bool(group_df["needs_review"].any() or len(group_df) > 1),
+                    "reply_count_after_send": int(group_df["reply_count_after_send"].fillna(0).max()),
+                }
+            )
+        return pd.DataFrame(summary_rows)
 
-    @staticmethod
-    def _join_key(ra_key: object, phone_sanitized: object, contact_slot: object) -> str:
-        parts = [
-            ResponseReportBuilder._safe_text(ra_key),
-            ResponseReportBuilder._safe_text(phone_sanitized),
-            ResponseReportBuilder._safe_text(contact_slot),
-        ]
-        return "|".join(parts)
+    def _detect_ledger_response(self, row: pd.Series) -> bool:
+        campaign_status = self._normalize_status(row.get("status_resposta"))
+        ledger_status = self._normalize_status(row.get("ledger_status_resposta"))
+        return campaign_status not in NON_RESPONSE_STATUSES or ledger_status not in NON_RESPONSE_STATUSES
 
-    @staticmethod
-    def _normalize_text(value: object) -> str:
-        text = ResponseReportBuilder._safe_text(value).lower()
-        text = (
-            text.replace("á", "a")
-            .replace("à", "a")
-            .replace("â", "a")
-            .replace("ã", "a")
-            .replace("é", "e")
-            .replace("ê", "e")
-            .replace("í", "i")
-            .replace("ó", "o")
-            .replace("ô", "o")
-            .replace("õ", "o")
-            .replace("ú", "u")
-            .replace("ç", "c")
-        )
-        text = re.sub(r"\s+", " ", text)
-        return text.strip()
+    def _write_report(self, report_parts: dict[str, pd.DataFrame], report_path: Path) -> None:
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        with pd.ExcelWriter(report_path, engine="openpyxl") as writer:
+            for sheet_name, df in report_parts.items():
+                df.to_excel(writer, sheet_name=sheet_name, index=False)
 
     @staticmethod
     def _safe_text(value: object) -> str:
-        if pd.isna(value):
+        if value is None:
             return ""
-        text = str(value).strip()
-        return "" if text.lower() == "nan" else text
+        if isinstance(value, float) and pd.isna(value):
+            return ""
+        return str(value).strip()
+
+    @staticmethod
+    def _digits_only(value: object) -> str:
+        return "".join(character for character in ResponseReportBuilder._safe_text(value) if character.isdigit())
+
+    @staticmethod
+    def _normalize_status(value: object) -> str:
+        return ResponseReportBuilder._safe_text(value).strip().lower()
+
+    @staticmethod
+    def _build_campaign_key(row: pd.Series) -> str:
+        return "|".join(
+            [
+                ResponseReportBuilder._safe_text(row.get("ra_key")),
+                ResponseReportBuilder._digits_only(row.get("phone_sanitized")),
+                ResponseReportBuilder._safe_text(row.get("contact_slot")),
+            ]
+        )
+
+    @staticmethod
+    def _append_reason(current: str, new_reason: str) -> str:
+        parts = [part.strip() for part in ResponseReportBuilder._safe_text(current).split("|") if part.strip()]
+        if new_reason and new_reason not in parts:
+            parts.append(new_reason)
+        return " | ".join(parts)
 
 
-def main() -> None:
+def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Gera relatorio final de retornos a partir da campanha e das exportacoes normalizadas do WhatsApp.",
+        description="Gera relatorio consolidado de retornos do WhatsApp para uma campanha.",
     )
     parser.add_argument(
         "--campaign",
         required=True,
-        help="Arquivo da campanha (.xlsx).",
+        help="Caminho do arquivo Excel da campanha.",
     )
     parser.add_argument(
         "--responses",
-        help="Base normalizada de respostas (.xlsx). Se omitido, usa a convencao por campaign_id.",
+        help="Caminho opcional da base normalizada gerada pelo parser.",
     )
     parser.add_argument(
         "--output",
-        help="Arquivo final .xlsx do relatorio de retornos.",
+        help="Caminho opcional do relatorio final.",
     )
-    args = parser.parse_args()
+    return parser
 
+
+def main() -> None:
+    args = build_argument_parser().parse_args()
     builder = ResponseReportBuilder(
         campaign_path=Path(args.campaign),
         responses_path=Path(args.responses) if args.responses else None,

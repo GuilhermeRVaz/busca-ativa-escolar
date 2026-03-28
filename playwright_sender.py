@@ -25,6 +25,15 @@ DEFAULT_CAMPAIGN_PATH = Path("relatorios/Campanha_TESTE.xlsx")
 DEFAULT_TEST_SESSION_DIR = Path("user_data/whatsapp_sender_session_test")
 DEFAULT_REAL_SESSION_DIR = Path("user_data/whatsapp_sender_session_real")
 DEFAULT_DAILY_LEDGER_PATH = Path("relatorios/Daily_Campaign_Ledger.xlsx")
+DEFAULT_INSTITUTIONAL_LEDGER_PATH = Path("relatorios/campanhas_institucionais/Institutional_Campaign_Ledger.xlsx")
+LEGACY_SENDER_DEFAULTS = {
+    "max_messages": 1,
+    "batch_size": 1,
+    "message_delay_min_seconds": 30.0,
+    "message_delay_max_seconds": 90.0,
+    "batch_break_min_seconds": 240.0,
+    "batch_break_max_seconds": 480.0,
+}
 REQUIRED_COLUMNS = [
     "campaign_id",
     "status_envio",
@@ -41,30 +50,74 @@ REQUIRED_COLUMNS = [
     "whatsapp_message",
     "contact_slot",
 ]
+FALLBACK_CONTACT_COLUMNS = [
+    "parent_name_2",
+    "phone_sanitized_2",
+    "contact_slot_2",
+    "parent_name_3",
+    "phone_sanitized_3",
+    "contact_slot_3",
+]
 
 
 class InvalidNumberError(RuntimeError):
     """Raised when WhatsApp indicates that a phone number is unavailable."""
 
 
+def _resolve_safety_profile(settings, requested_profile: str | None) -> str:
+    profile = (requested_profile or settings.sender_safety_profile or "conservative").strip().lower()
+    return profile if profile in {"conservative", "custom"} else "conservative"
+
+
+def _resolve_sender_defaults(settings, safety_profile: str) -> dict[str, float | int]:
+    if safety_profile == "custom":
+        return dict(LEGACY_SENDER_DEFAULTS)
+    return {
+        "max_messages": settings.sender_default_max_messages,
+        "batch_size": settings.sender_default_batch_size,
+        "message_delay_min_seconds": settings.sender_default_message_delay_min_seconds,
+        "message_delay_max_seconds": settings.sender_default_message_delay_max_seconds,
+        "batch_break_min_seconds": settings.sender_default_batch_break_min_seconds,
+        "batch_break_max_seconds": settings.sender_default_batch_break_max_seconds,
+    }
+
+
 class PlaywrightSender:
-    def __init__(self, campaign_path: Path, session_dir: Path) -> None:
+    def __init__(
+        self,
+        campaign_path: Path,
+        session_dir: Path,
+        ledger_path_override: Path | None = None,
+    ) -> None:
         self.campaign_path = campaign_path
         self.session_dir = session_dir
+        self.ledger_path_override = ledger_path_override
 
     def run(
         self,
         dry_run: bool = True,
         max_messages: int = 1,
+        start_row: int = 0,
         typing_delay_ms: int = 35,
         batch_size: int = 1,
         message_delay_min_seconds: float = 30.0,
         message_delay_max_seconds: float = 90.0,
         batch_break_min_seconds: float = 240.0,
         batch_break_max_seconds: float = 480.0,
+        safety_profile: str = "custom",
     ) -> int:
         campaign_df = self._load_campaign()
-        pending_rows = self._select_pending_rows(campaign_df, max_messages=max_messages)
+        campaign_df, reconciled_count = self._reconcile_sent_status_with_ledger(campaign_df)
+        if reconciled_count:
+            logger.info(
+                "Historico aplicado antes do envio: %s linha(s) ja constavam como enviadas no ledger.",
+                reconciled_count,
+            )
+        pending_rows = self._select_pending_rows(
+            campaign_df,
+            max_messages=max_messages,
+            start_row=start_row,
+        )
 
         if pending_rows.empty:
             logger.info("Nenhuma linha pendente e valida encontrada em %s.", self.campaign_path)
@@ -76,7 +129,9 @@ class PlaywrightSender:
             dry_run,
         )
         logger.info(
-            "Configuracao de envio | batch_size=%s | pausa_msg=%.1fs-%.1fs | pausa_lote=%.1fs-%.1fs",
+            "Configuracao de envio | perfil=%s | max_messages=%s | batch_size=%s | pausa_msg=%.1fs-%.1fs | pausa_lote=%.1fs-%.1fs",
+            safety_profile,
+            max_messages,
             batch_size,
             message_delay_min_seconds,
             message_delay_max_seconds,
@@ -96,6 +151,8 @@ class PlaywrightSender:
 
         self.session_dir.mkdir(parents=True, exist_ok=True)
         self._backup_campaign()
+        if reconciled_count:
+            self._persist_campaign_state(campaign_df)
 
         sent_count = 0
         total_selected = len(pending_rows)
@@ -124,70 +181,86 @@ class PlaywrightSender:
                         current_batch,
                         row["student_name"],
                     )
-                    try:
-                        self._send_single_message(
-                            page=page,
-                            phone=str(row["phone_sanitized"]),
-                            message=str(row["whatsapp_message"]),
-                            typing_delay_ms=typing_delay_ms,
-                        )
-                        campaign_df.at[index, "status_envio"] = "enviado"
-                        campaign_df.at[index, "data_envio"] = datetime.now().strftime(
-                            "%Y-%m-%d %H:%M:%S",
-                        )
-                        campaign_df.at[index, "observacao"] = self._append_observation(
-                            campaign_df.at[index, "observacao"],
-                            "Enviado via playwright_sender.",
-                        )
-                        sent_count += 1
-                        self._persist_campaign_state(campaign_df)
-                        logger.info(
-                            "Envio concluido | linha=%s | aluno=%s",
-                            index,
-                            row["student_name"],
-                        )
-                        self._sleep_after_send(
-                            sent_count=sent_count,
-                            total_selected=total_selected,
-                            batch_size=batch_size,
-                            message_delay_min_seconds=message_delay_min_seconds,
-                            message_delay_max_seconds=message_delay_max_seconds,
-                            batch_break_min_seconds=batch_break_min_seconds,
-                            batch_break_max_seconds=batch_break_max_seconds,
-                        )
-                    except InvalidNumberError as exc:
-                        campaign_df.at[index, "status_envio"] = "falha"
-                        campaign_df.at[index, "status_resposta"] = "numero_invalido"
-                        campaign_df.at[index, "observacao"] = self._append_observation(
-                            campaign_df.at[index, "observacao"],
-                            f"Numero invalido ou ausente no WhatsApp: {exc}",
-                        )
-                        self._persist_campaign_state(campaign_df)
-                        logger.warning(
-                            "Numero nao encontrado no WhatsApp | linha=%s | aluno=%s | telefone=%s",
-                            index,
-                            row["student_name"],
-                            row["phone_sanitized"],
-                        )
-                        continue
-                    except Exception as exc:
-                        campaign_df.at[index, "status_envio"] = "falha"
-                        if "invalido" in str(exc).lower():
+                    while True:
+                        row = campaign_df.loc[index].copy()
+                        try:
+                            self._send_single_message(
+                                page=page,
+                                phone=str(row["phone_sanitized"]),
+                                message=str(row["whatsapp_message"]),
+                                typing_delay_ms=typing_delay_ms,
+                            )
+                            campaign_df.at[index, "status_envio"] = "enviado"
+                            campaign_df.at[index, "data_envio"] = datetime.now().strftime(
+                                "%Y-%m-%d %H:%M:%S",
+                            )
+                            campaign_df.at[index, "observacao"] = self._append_observation(
+                                campaign_df.at[index, "observacao"],
+                                f"Enviado via playwright_sender para {row['contact_slot']} ({row['phone_sanitized']}).",
+                            )
+                            sent_count += 1
+                            self._persist_campaign_state(campaign_df)
+                            logger.info(
+                                "Envio concluido | linha=%s | aluno=%s | contato=%s",
+                                index,
+                                row["student_name"],
+                                row["contact_slot"],
+                            )
+                            self._sleep_after_send(
+                                sent_count=sent_count,
+                                total_selected=total_selected,
+                                batch_size=batch_size,
+                                message_delay_min_seconds=message_delay_min_seconds,
+                                message_delay_max_seconds=message_delay_max_seconds,
+                                batch_break_min_seconds=batch_break_min_seconds,
+                                batch_break_max_seconds=batch_break_max_seconds,
+                            )
+                            break
+                        except InvalidNumberError as exc:
+                            rotated = self._promote_fallback_contact(
+                                campaign_df,
+                                index,
+                                reason=f"Numero invalido ou ausente no WhatsApp: {exc}",
+                            )
+                            self._persist_campaign_state(campaign_df)
+                            logger.warning(
+                                "Numero nao encontrado no WhatsApp | linha=%s | aluno=%s | telefone=%s",
+                                index,
+                                row["student_name"],
+                                row["phone_sanitized"],
+                            )
+                            if rotated:
+                                logger.info(
+                                    "Tentando contato alternativo para linha=%s | aluno=%s",
+                                    index,
+                                    row["student_name"],
+                                )
+                                continue
+                            campaign_df.at[index, "status_envio"] = "falha"
                             campaign_df.at[index, "status_resposta"] = "numero_invalido"
-                        campaign_df.at[index, "observacao"] = self._append_observation(
-                            campaign_df.at[index, "observacao"],
-                            f"Falha no envio: {exc}",
-                        )
-                        self._persist_campaign_state(campaign_df)
-                        logger.exception(
-                            "Falha no envio | linha=%s | aluno=%s | erro=%s",
-                            index,
-                            row["student_name"],
-                            exc,
-                        )
-                        break
+                            self._persist_campaign_state(campaign_df)
+                            break
+                        except Exception as exc:
+                            logger.exception(
+                                "Falha no envio | linha=%s | aluno=%s | erro=%s",
+                                index,
+                                row["student_name"],
+                                exc,
+                            )
+                            campaign_df.at[index, "status_envio"] = "falha"
+                            campaign_df.at[index, "observacao"] = self._append_observation(
+                                campaign_df.at[index, "observacao"],
+                                f"Falha no envio sem troca automatica de contato: {exc}",
+                            )
+                            if "invalido" in str(exc).lower():
+                                campaign_df.at[index, "status_resposta"] = "numero_invalido"
+                            self._persist_campaign_state(campaign_df)
+                            break
             finally:
-                context.close()
+                try:
+                    context.close()
+                except Exception as exc:
+                    logger.warning("Contexto do navegador ja estava fechado ao encerrar a execucao: %s", exc)
 
         self._sync_campaign_to_ledger(campaign_df)
         self._write_operational_report(campaign_df)
@@ -203,12 +276,90 @@ class PlaywrightSender:
             raise KeyError(
                 "Arquivo de campanha sem colunas obrigatorias: " + ", ".join(missing_columns),
             )
+        for column in ["campaign_row_id", *FALLBACK_CONTACT_COLUMNS, "status_envio", "data_envio", "observacao", "status_resposta"]:
+            if column not in df.columns:
+                df[column] = ""
         for column in ["status_envio", "data_envio", "observacao", "status_resposta"]:
             if column in df.columns:
                 df[column] = df[column].astype("object")
+        for column in ["phone_sanitized", "phone_sanitized_2", "phone_sanitized_3"]:
+            if column in df.columns:
+                df[column] = df[column].apply(self._normalize_phone).astype("object")
+        for column in ["parent_name", "parent_name_2", "parent_name_3", "contact_slot", "contact_slot_2", "contact_slot_3", "campaign_row_id"]:
+            if column in df.columns:
+                df[column] = df[column].apply(self._safe_text).astype("object")
+        if "campaign_row_id" in df.columns:
+            df["campaign_row_id"] = df.apply(self._ensure_campaign_row_id, axis=1).astype("object")
+        if self._is_institutional_campaign():
+            df = self._collapse_institutional_student_rows(df)
         return df.copy()
 
-    def _select_pending_rows(self, df: pd.DataFrame, max_messages: int) -> pd.DataFrame:
+    def _reconcile_sent_status_with_ledger(self, campaign_df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+        if not self._is_institutional_campaign():
+            return campaign_df, 0
+
+        settings = get_settings()
+        ledger_path = self._resolve_ledger_path(settings)
+        if not ledger_path.exists():
+            return campaign_df, 0
+
+        ledger_df = pd.read_excel(ledger_path, sheet_name="Historico")
+        if ledger_df.empty:
+            return campaign_df, 0
+
+        working_campaign = campaign_df.copy()
+        working_ledger = ledger_df.copy()
+        for df in (working_campaign, working_ledger):
+            for column in ["ra_key", "contact_slot", "status_envio", "status_resposta", "data_envio", "observacao", "campaign_id", "campaign_row_id"]:
+                if column not in df.columns:
+                    df[column] = ""
+                df[column] = df[column].apply(self._safe_text).astype("object")
+            for column in ["phone_sanitized", "phone_sanitized_2", "phone_sanitized_3"]:
+                if column not in df.columns:
+                    df[column] = ""
+                df[column] = df[column].apply(self._normalize_phone).astype("object")
+
+        working_campaign["campaign_row_id"] = working_campaign.apply(self._ensure_campaign_row_id, axis=1).astype("object")
+        working_ledger["campaign_row_id"] = working_ledger.apply(self._ensure_campaign_row_id, axis=1).astype("object")
+        working_campaign["_history_key"] = working_campaign.apply(self._build_history_key, axis=1)
+        working_ledger["_history_key"] = working_ledger.apply(self._build_history_key, axis=1)
+
+        sent_ledger = working_ledger.loc[
+            working_ledger["status_envio"].str.lower().eq("enviado")
+            & working_ledger["_history_key"].ne("")
+        ].copy()
+        if sent_ledger.empty:
+            return working_campaign.drop(columns=["_history_key"]), 0
+
+        sent_ledger = sent_ledger.sort_values(["data_envio", "campaign_id"], kind="stable")
+        sent_by_key = sent_ledger.drop_duplicates(subset=["_history_key"], keep="last").set_index("_history_key")
+
+        reconciled_count = 0
+        for index, row in working_campaign.iterrows():
+            current_status = self._safe_text(row.get("status_envio")).lower()
+            history_key = self._safe_text(row.get("_history_key"))
+            if current_status == "enviado" or not history_key or history_key not in sent_by_key.index:
+                continue
+
+            source_row = sent_by_key.loc[history_key]
+            working_campaign.at[index, "status_envio"] = "enviado"
+            if not self._safe_text(working_campaign.at[index, "data_envio"]):
+                working_campaign.at[index, "data_envio"] = self._safe_text(source_row.get("data_envio"))
+            source_response = self._safe_text(source_row.get("status_resposta"))
+            if source_response and not self._safe_text(working_campaign.at[index, "status_resposta"]):
+                working_campaign.at[index, "status_resposta"] = source_response
+            working_campaign.at[index, "observacao"] = self._append_observation(
+                working_campaign.at[index, "observacao"],
+                (
+                    "Marcado como enviado com base no ledger institucional "
+                    f"({ledger_path.name}) para evitar reenvio ao mesmo responsavel."
+                ),
+            )
+            reconciled_count += 1
+
+        return working_campaign.drop(columns=["_history_key"]), reconciled_count
+
+    def _select_pending_rows(self, df: pd.DataFrame, max_messages: int, start_row: int = 0) -> pd.DataFrame:
         prepared = df.copy()
         prepared["phone_sanitized"] = prepared["phone_sanitized"].apply(self._normalize_phone)
         prepared["whatsapp_message"] = prepared["whatsapp_message"].apply(self._safe_text)
@@ -219,7 +370,141 @@ class PlaywrightSender:
             & prepared["whatsapp_message"].ne("")
             & prepared["status_envio"].isin({"", "pendente", "falha"})
         ].copy()
+        if start_row > 0:
+            filtered = filtered.loc[filtered.index >= start_row].copy()
         return filtered.head(max_messages)
+
+    def _promote_fallback_contact(self, campaign_df: pd.DataFrame, index: int, reason: str) -> bool:
+        current_slot = self._safe_text(campaign_df.at[index, "contact_slot"])
+        current_phone = self._safe_text(campaign_df.at[index, "phone_sanitized"])
+        next_phone = self._safe_text(campaign_df.at[index, "phone_sanitized_2"])
+        if not next_phone:
+            campaign_df.at[index, "observacao"] = self._append_observation(
+                campaign_df.at[index, "observacao"],
+                f"{reason} | Sem contato alternativo apos {current_slot or 'contato_atual'} ({current_phone}).",
+            )
+            return False
+
+        next_parent = self._safe_text(campaign_df.at[index, "parent_name_2"]) or "Responsavel"
+        next_slot = self._safe_text(campaign_df.at[index, "contact_slot_2"]) or "responsavel_2"
+        campaign_df.at[index, "observacao"] = self._append_observation(
+            campaign_df.at[index, "observacao"],
+            (
+                f"{reason} | Fallback acionado: {current_slot or 'contato_atual'} ({current_phone}) "
+                f"-> {next_slot} ({next_phone})."
+            ),
+        )
+        campaign_df.at[index, "parent_name"] = next_parent
+        campaign_df.at[index, "phone_sanitized"] = next_phone
+        campaign_df.at[index, "contact_slot"] = next_slot
+        campaign_df.at[index, "parent_name_2"] = self._safe_text(campaign_df.at[index, "parent_name_3"])
+        campaign_df.at[index, "phone_sanitized_2"] = self._safe_text(campaign_df.at[index, "phone_sanitized_3"])
+        campaign_df.at[index, "contact_slot_2"] = self._safe_text(campaign_df.at[index, "contact_slot_3"])
+        campaign_df.at[index, "parent_name_3"] = ""
+        campaign_df.at[index, "phone_sanitized_3"] = ""
+        campaign_df.at[index, "contact_slot_3"] = ""
+        campaign_df.at[index, "status_envio"] = "pendente"
+        campaign_df.at[index, "status_resposta"] = campaign_df.at[index, "status_resposta"] or "sem_resposta"
+        return True
+
+    def _is_institutional_campaign(self) -> bool:
+        return "campanhas_institucionais" in str(self.campaign_path.parent).lower()
+
+    def _collapse_institutional_student_rows(self, df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty or "ra_key" not in df.columns:
+            return df
+
+        working = df.copy().reset_index().rename(columns={"index": "_source_index"})
+        ra_keys = working["ra_key"].fillna("").astype(str).str.strip()
+        if not ra_keys.duplicated(keep=False).any():
+            return working.drop(columns=["_source_index"])
+
+        collapsed_rows: list[pd.Series] = []
+        grouped = working.groupby(["campaign_id", "ra_key"], sort=False, dropna=False)
+        for _, group in grouped:
+            ordered_group = group.sort_values("_source_index", kind="stable")
+            sent_group = ordered_group[
+                ordered_group["status_envio"].apply(self._safe_text).str.lower().eq("enviado")
+            ]
+            active_group = ordered_group[
+                ordered_group["status_envio"].apply(self._safe_text).str.lower().isin({"", "pendente", "falha"})
+            ]
+            base_row = (
+                sent_group.sort_values(["data_envio", "_source_index"], kind="stable").iloc[0].copy()
+                if not sent_group.empty
+                else (active_group.iloc[0].copy() if not active_group.empty else ordered_group.iloc[0].copy())
+            )
+
+            contacts = self._collect_contacts_from_group(ordered_group)
+            preferred_phone = self._normalize_phone(base_row.get("phone_sanitized"))
+            if preferred_phone:
+                contacts = sorted(contacts, key=lambda item: item[1] != preferred_phone)
+
+            if contacts:
+                base_row["parent_name"] = contacts[0][0]
+                base_row["phone_sanitized"] = contacts[0][1]
+                base_row["contact_slot"] = contacts[0][2]
+            else:
+                base_row["parent_name"] = self._safe_text(base_row.get("parent_name")) or "Responsavel"
+                base_row["phone_sanitized"] = self._normalize_phone(base_row.get("phone_sanitized"))
+                base_row["contact_slot"] = self._safe_text(base_row.get("contact_slot")) or "responsavel_1"
+
+            for fallback_index in range(2, 4):
+                contact_position = fallback_index - 1
+                if contact_position < len(contacts):
+                    parent_name, phone, slot = contacts[contact_position]
+                else:
+                    parent_name, phone, slot = ("", "", "")
+                base_row[f"parent_name_{fallback_index}"] = parent_name
+                base_row[f"phone_sanitized_{fallback_index}"] = phone
+                base_row[f"contact_slot_{fallback_index}"] = slot
+
+            observations: list[str] = []
+            for value in ordered_group["observacao"].tolist():
+                text = self._safe_text(value)
+                if text and text not in observations:
+                    observations.append(text)
+            base_row["observacao"] = " | ".join(observations)
+
+            if not sent_group.empty:
+                sent_row = sent_group.sort_values(["data_envio", "_source_index"], kind="stable").iloc[0]
+                base_row["status_envio"] = "enviado"
+                base_row["data_envio"] = self._safe_text(sent_row.get("data_envio"))
+                base_row["status_resposta"] = (
+                    self._safe_text(sent_row.get("status_resposta"))
+                    or self._safe_text(base_row.get("status_resposta"))
+                )
+
+            base_row["campaign_row_id"] = self._ensure_campaign_row_id(base_row)
+            collapsed_rows.append(base_row)
+
+        collapsed_df = pd.DataFrame(collapsed_rows)
+        collapsed_df = collapsed_df.sort_values("_source_index", kind="stable").drop(columns=["_source_index"])
+        logger.info(
+            "Campanha institucional consolidada para %s aluno(s); %s linha(s) por contato foram agrupadas.",
+            len(collapsed_df),
+            len(df) - len(collapsed_df),
+        )
+        return collapsed_df[df.columns]
+
+    def _collect_contacts_from_group(self, group: pd.DataFrame) -> list[tuple[str, str, str]]:
+        contacts: list[tuple[str, str, str]] = []
+        seen_phones: set[str] = set()
+        contact_columns = [
+            ("parent_name", "phone_sanitized", "contact_slot"),
+            ("parent_name_2", "phone_sanitized_2", "contact_slot_2"),
+            ("parent_name_3", "phone_sanitized_3", "contact_slot_3"),
+        ]
+        for _, row in group.iterrows():
+            for parent_column, phone_column, slot_column in contact_columns:
+                phone = self._normalize_phone(row.get(phone_column))
+                if not phone or phone in seen_phones:
+                    continue
+                parent_name = self._safe_text(row.get(parent_column)) or "Responsavel"
+                slot = self._safe_text(row.get(slot_column)) or "responsavel_1"
+                contacts.append((parent_name, phone, slot))
+                seen_phones.add(phone)
+        return contacts
 
     def _send_single_message(
         self,
@@ -237,7 +522,11 @@ class PlaywrightSender:
 
         message_box = self._wait_for_message_box(page)
         message_box.click()
-        message_box.press_sequentially(message, delay=typing_delay_ms)
+        try:
+            message_box.press_sequentially(message, delay=typing_delay_ms)
+        except PlaywrightTimeoutError:
+            logger.warning("Digitacao sequencial excedeu o tempo. Aplicando fallback com insert_text.")
+            page.keyboard.insert_text(message)
         time.sleep(random.uniform(1.5, 3.0))
         page.keyboard.press("Enter")
         time.sleep(random.uniform(2.0, 4.0))
@@ -323,19 +612,6 @@ class PlaywrightSender:
             return
 
         ledger_df = pd.read_excel(ledger_path, sheet_name="Historico")
-        for column in [
-            "campaign_id",
-            "status_envio",
-            "data_envio",
-            "status_resposta",
-            "observacao",
-            "message_template_id",
-            "phone_sanitized",
-            "ra_key",
-            "contact_slot",
-        ]:
-            if column in ledger_df.columns:
-                ledger_df[column] = ledger_df[column].astype("object")
         for column in campaign_df.columns:
             if column not in ledger_df.columns:
                 ledger_df[column] = ""
@@ -343,7 +619,38 @@ class PlaywrightSender:
             if column not in campaign_df.columns:
                 campaign_df[column] = ""
 
-        key_columns = ["campaign_id", "ra_key", "phone_sanitized", "contact_slot"]
+        object_columns = {
+            "campaign_row_id",
+            "campaign_id",
+            "status_envio",
+            "data_envio",
+            "status_resposta",
+            "observacao",
+            "message_template_id",
+            "phone_sanitized",
+            "phone_sanitized_2",
+            "phone_sanitized_3",
+            "ra_key",
+            "contact_slot",
+            "contact_slot_2",
+            "contact_slot_3",
+            "parent_name",
+            "parent_name_2",
+            "parent_name_3",
+        }
+        for column in object_columns:
+            if column in ledger_df.columns:
+                if column.startswith("phone_sanitized"):
+                    ledger_df[column] = ledger_df[column].apply(self._normalize_phone).astype("object")
+                else:
+                    ledger_df[column] = ledger_df[column].apply(self._safe_text).astype("object")
+            if column in campaign_df.columns:
+                if column.startswith("phone_sanitized"):
+                    campaign_df[column] = campaign_df[column].apply(self._normalize_phone).astype("object")
+                else:
+                    campaign_df[column] = campaign_df[column].apply(self._safe_text).astype("object")
+
+        key_columns = self._resolve_merge_key_columns(ledger_df, campaign_df)
         ledger_df["_merge_key"] = ledger_df.apply(
             lambda row: self._build_merge_key(row, key_columns),
             axis=1,
@@ -470,11 +777,49 @@ class PlaywrightSender:
         return extra if not existing else f"{existing} | {extra}"
 
     @staticmethod
+    def _build_history_key(row: pd.Series) -> str:
+        ra_key = PlaywrightSender._safe_text(row.get("ra_key"))
+        phone = PlaywrightSender._normalize_phone(row.get("phone_sanitized"))
+        contact_slot = PlaywrightSender._safe_text(row.get("contact_slot"))
+        if not ra_key or not phone:
+            return ""
+        return "|".join([ra_key, phone, contact_slot])
+
+    @staticmethod
+    def _ensure_campaign_row_id(row: pd.Series) -> str:
+        existing = PlaywrightSender._safe_text(row.get("campaign_row_id"))
+        if existing:
+            return existing
+        campaign_id = PlaywrightSender._safe_text(row.get("campaign_id"))
+        history_key = PlaywrightSender._build_history_key(row)
+        if campaign_id and history_key:
+            return f"{campaign_id}|{history_key}"
+        if campaign_id:
+            ra_key = PlaywrightSender._safe_text(row.get("ra_key"))
+            if ra_key:
+                return f"{campaign_id}|{ra_key}"
+        return ""
+
+    @staticmethod
     def _build_merge_key(row: pd.Series, key_columns: list[str]) -> str:
         parts = [PlaywrightSender._safe_text(row.get(column)) for column in key_columns]
         return "|".join(parts)
 
+    @staticmethod
+    def _resolve_merge_key_columns(ledger_df: pd.DataFrame, campaign_df: pd.DataFrame) -> list[str]:
+        if (
+            "campaign_row_id" in ledger_df.columns
+            and "campaign_row_id" in campaign_df.columns
+            and campaign_df["campaign_row_id"].fillna("").astype(str).str.strip().ne("").any()
+        ):
+            return ["campaign_row_id"]
+        return ["campaign_id", "ra_key", "phone_sanitized", "contact_slot"]
+
     def _resolve_ledger_path(self, settings) -> Path:
+        if self.ledger_path_override is not None:
+            return self.ledger_path_override
+        if "campanhas_institucionais" in str(self.campaign_path.parent).lower():
+            return DEFAULT_INSTITUTIONAL_LEDGER_PATH
         if self.campaign_path.stem.lower().startswith("campanha_diaria_"):
             return DEFAULT_DAILY_LEDGER_PATH
         return settings.campaign_ledger_path
@@ -547,6 +892,10 @@ def main() -> None:
         help="Diretorio da sessao persistente do WhatsApp Web.",
     )
     parser.add_argument(
+        "--ledger-path",
+        help="Caminho opcional para sincronizar um ledger especifico.",
+    )
+    parser.add_argument(
         "--send",
         action="store_true",
         help="Executa envio real. Sem essa flag, roda em dry-run.",
@@ -554,14 +903,18 @@ def main() -> None:
     parser.add_argument(
         "--max-messages",
         type=int,
-        default=1,
-        help="Maximo de mensagens por execucao. Padrao: 1",
+        help="Maximo de mensagens por execucao. Quando omitido, usa o perfil de seguranca ativo.",
+    )
+    parser.add_argument(
+        "--start-row",
+        type=int,
+        default=0,
+        help="Indice minimo da linha da campanha a partir do qual o sender deve retomar. Padrao: 0",
     )
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=1,
-        help="Quantidade de mensagens por lote. Padrao: 1",
+        help="Quantidade de mensagens por lote. Quando omitido, usa o perfil de seguranca ativo.",
     )
     parser.add_argument(
         "--typing-delay-ms",
@@ -572,36 +925,66 @@ def main() -> None:
     parser.add_argument(
         "--message-delay-min-seconds",
         type=float,
-        default=30.0,
-        help="Pausa minima entre mensagens. Padrao: 30s",
+        help="Pausa minima entre mensagens. Quando omitido, usa o perfil de seguranca ativo.",
     )
     parser.add_argument(
         "--message-delay-max-seconds",
         type=float,
-        default=90.0,
-        help="Pausa maxima entre mensagens. Padrao: 90s",
+        help="Pausa maxima entre mensagens. Quando omitido, usa o perfil de seguranca ativo.",
     )
     parser.add_argument(
         "--batch-break-min-seconds",
         type=float,
-        default=240.0,
-        help="Pausa minima entre lotes. Padrao: 240s",
+        help="Pausa minima entre lotes. Quando omitido, usa o perfil de seguranca ativo.",
     )
     parser.add_argument(
         "--batch-break-max-seconds",
         type=float,
-        default=480.0,
-        help="Pausa maxima entre lotes. Padrao: 480s",
+        help="Pausa maxima entre lotes. Quando omitido, usa o perfil de seguranca ativo.",
+    )
+    parser.add_argument(
+        "--safety-profile",
+        choices=["conservative", "custom"],
+        help="Perfil de seguranca do sender. Quando omitido, usa SENDER_SAFETY_PROFILE.",
     )
     args = parser.parse_args()
 
-    if args.batch_size < 1:
+    settings = get_settings()
+    safety_profile = _resolve_safety_profile(settings, args.safety_profile)
+    sender_defaults = _resolve_sender_defaults(settings, safety_profile)
+
+    max_messages = int(args.max_messages if args.max_messages is not None else sender_defaults["max_messages"])
+    batch_size = int(args.batch_size if args.batch_size is not None else sender_defaults["batch_size"])
+    message_delay_min_seconds = float(
+        args.message_delay_min_seconds
+        if args.message_delay_min_seconds is not None
+        else sender_defaults["message_delay_min_seconds"]
+    )
+    message_delay_max_seconds = float(
+        args.message_delay_max_seconds
+        if args.message_delay_max_seconds is not None
+        else sender_defaults["message_delay_max_seconds"]
+    )
+    batch_break_min_seconds = float(
+        args.batch_break_min_seconds
+        if args.batch_break_min_seconds is not None
+        else sender_defaults["batch_break_min_seconds"]
+    )
+    batch_break_max_seconds = float(
+        args.batch_break_max_seconds
+        if args.batch_break_max_seconds is not None
+        else sender_defaults["batch_break_max_seconds"]
+    )
+
+    if batch_size < 1:
         parser.error("--batch-size deve ser maior ou igual a 1.")
-    if args.max_messages < 1:
+    if max_messages < 1:
         parser.error("--max-messages deve ser maior ou igual a 1.")
-    if args.message_delay_min_seconds > args.message_delay_max_seconds:
+    if args.start_row < 0:
+        parser.error("--start-row deve ser maior ou igual a 0.")
+    if message_delay_min_seconds > message_delay_max_seconds:
         parser.error("message-delay-min-seconds nao pode ser maior que message-delay-max-seconds.")
-    if args.batch_break_min_seconds > args.batch_break_max_seconds:
+    if batch_break_min_seconds > batch_break_max_seconds:
         parser.error("batch-break-min-seconds nao pode ser maior que batch-break-max-seconds.")
 
     campaign_path = Path(args.campaign)
@@ -617,17 +1000,20 @@ def main() -> None:
     sender = PlaywrightSender(
         campaign_path=campaign_path,
         session_dir=session_dir,
+        ledger_path_override=Path(args.ledger_path) if args.ledger_path else None,
     )
     try:
         processed = sender.run(
             dry_run=not args.send,
-            max_messages=max(1, args.max_messages),
+            max_messages=max_messages,
+            start_row=args.start_row,
             typing_delay_ms=max(0, args.typing_delay_ms),
-            batch_size=args.batch_size,
-            message_delay_min_seconds=args.message_delay_min_seconds,
-            message_delay_max_seconds=args.message_delay_max_seconds,
-            batch_break_min_seconds=args.batch_break_min_seconds,
-            batch_break_max_seconds=args.batch_break_max_seconds,
+            batch_size=batch_size,
+            message_delay_min_seconds=message_delay_min_seconds,
+            message_delay_max_seconds=message_delay_max_seconds,
+            batch_break_min_seconds=batch_break_min_seconds,
+            batch_break_max_seconds=batch_break_max_seconds,
+            safety_profile=safety_profile,
         )
     except Exception as exc:
         logger.exception("Falha no sender: %s", exc)

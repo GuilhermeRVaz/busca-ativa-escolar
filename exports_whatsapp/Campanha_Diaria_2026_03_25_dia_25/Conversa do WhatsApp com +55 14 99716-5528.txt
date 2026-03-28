@@ -1,0 +1,8 @@
+25/03/2026 10:59 - As mensagens e ligações são protegidas com a criptografia de ponta a ponta. Somente as pessoas que fazem parte da conversa podem ler, ouvir e compartilhar esse conteúdo. *Saiba mais*
+25/03/2026 10:58 - Escola Décia L M dos Santos: Bom dia/boa tarde, mãe. Informamos que YURI GONÇALO DA SILVA, da turma 7 ANO 7A INTEGRAL 9H ANUAL, faltou as aulas nos dias 25. Pedimos a gentileza de justificar ou procurar a secretaria.
+25/03/2026 10:59 - +55 14 99716-5528: Oi
+25/03/2026 11:00 - +55 14 99716-5528: Ele faltou sim nos dias de chuva pq n teve como ir e hj não foi TB pois perdi o horário e n só ele faltou meus outros filhos TB
+25/03/2026 11:00 - +55 14 99716-5528: Hj n foi justamente por conta que n escutamos o Cel despertar
+25/03/2026 11:01 - +55 14 99716-5528: E TDS irmão TB não foi
+25/03/2026 13:20 - Escola Décia L M dos Santos: boa tarde, obrigado por informar.
+Estamos implementando um sistema de busca ativa automatica e as mensagens nesse caso de irmãos podera se repetir, se acontecer e não atrapalhar justifique novamente para o sistema fazer o processamento.

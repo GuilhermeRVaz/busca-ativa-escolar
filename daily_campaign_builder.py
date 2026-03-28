@@ -38,7 +38,7 @@ class DailyCampaignBuilder:
     def __init__(self, settings: Optional[Settings] = None) -> None:
         self.settings = settings or get_settings()
         self.processor = ActiveSchoolSearchProcessor(self.settings)
-        self.message_catalog = MessageCatalog()
+        self.message_catalog = MessageCatalog(school_name=self.settings.school_name)
 
     def build_campaign(
         self,
@@ -234,21 +234,23 @@ class DailyCampaignBuilder:
                 "student_name",
                 "ra_raw",
                 "ra_key",
-                "parent_name",
-                "phone_sanitized",
                 "absence_days",
-                "contact_slot",
+                "parent_name_1",
+                "phone_sanitized_1",
+                "parent_name_2",
+                "phone_sanitized_2",
+                "parent_name_3",
+                "phone_sanitized_3",
             ]
         ].copy()
-        campaign_df = campaign_df.drop_duplicates(
-            subset=["ra_key", "phone_sanitized", "contact_slot"],
-            keep="first",
-        )
+        campaign_df = campaign_df.drop_duplicates(subset=["ra_key"], keep="first").reset_index(drop=True)
+        campaign_df = campaign_df.apply(self._arrange_contact_priority, axis=1)
 
         template_details = campaign_df.apply(
             lambda row: self.message_catalog.build_message(
                 parent_name=str(row["parent_name"]),
                 student_name=str(row["student_name"]),
+                class_name=str(row["class_name"]),
                 absence_days=str(row["absence_days"]),
                 campaign_id=campaign_id,
                 unique_key=f"{row['ra_key']}|{row['phone_sanitized']}|{row['contact_slot']}",
@@ -258,13 +260,43 @@ class DailyCampaignBuilder:
         campaign_df["message_template_id"] = template_details.apply(lambda value: value[0])
         campaign_df["whatsapp_message"] = template_details.apply(lambda value: value[1])
 
+        campaign_df.insert(0, "campaign_row_id", campaign_df.apply(lambda row: f"{campaign_id}|{row['ra_key']}", axis=1))
         campaign_df.insert(0, "observacao", f"Campanha diaria referente ao dia {resolved_day}.")
         campaign_df.insert(0, "status_resposta", "sem_resposta")
         campaign_df.insert(0, "data_envio", "")
         campaign_df.insert(0, "status_envio", "pendente")
         campaign_df.insert(0, "data_criacao", created_at.strftime("%Y-%m-%d %H:%M:%S"))
         campaign_df.insert(0, "campaign_id", campaign_id)
+        for column in CAMPAIGN_COLUMNS:
+            if column not in campaign_df.columns:
+                campaign_df[column] = ""
         return campaign_df[CAMPAIGN_COLUMNS]
+
+    @staticmethod
+    def _arrange_contact_priority(row: pd.Series) -> pd.Series:
+        contacts: list[tuple[str, str, str]] = []
+        for index in range(1, 4):
+            phone = str(row.get(f"phone_sanitized_{index}", "") or "").strip()
+            if not phone:
+                continue
+            parent = str(row.get(f"parent_name_{index}", "") or "").strip() or "Responsavel"
+            contacts.append((parent, phone, f"responsavel_{index}"))
+
+        for target_index in range(3):
+            if target_index < len(contacts):
+                parent, phone, slot = contacts[target_index]
+            else:
+                parent, phone, slot = ("", "", "")
+            if target_index == 0:
+                row["parent_name"] = parent or "Responsavel"
+                row["phone_sanitized"] = phone
+                row["contact_slot"] = slot or "responsavel_1"
+            else:
+                suffix = target_index + 1
+                row[f"parent_name_{suffix}"] = parent
+                row[f"phone_sanitized_{suffix}"] = phone
+                row[f"contact_slot_{suffix}"] = slot
+        return row
 
     @staticmethod
     def _empty_campaign_dataframe(campaign_id: str, created_at: datetime) -> pd.DataFrame:
@@ -283,7 +315,7 @@ class DailyCampaignBuilder:
     @staticmethod
     def _append_campaign_to_ledger(ledger_df: pd.DataFrame, campaign_df: pd.DataFrame) -> pd.DataFrame:
         combined = pd.concat([ledger_df, campaign_df], ignore_index=True)
-        dedup_keys = ["campaign_id", "ra_key", "phone_sanitized", "contact_slot"]
+        dedup_keys = ["campaign_row_id"] if "campaign_row_id" in combined.columns else ["campaign_id", "ra_key", "phone_sanitized", "contact_slot"]
         combined = combined.drop_duplicates(subset=dedup_keys, keep="first")
         return combined[CAMPAIGN_COLUMNS].copy()
 

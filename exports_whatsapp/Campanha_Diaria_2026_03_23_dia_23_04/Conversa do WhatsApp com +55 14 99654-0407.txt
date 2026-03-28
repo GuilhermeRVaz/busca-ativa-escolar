@@ -1,0 +1,9 @@
+23/03/2026 10:39 - As mensagens e ligações são protegidas com a criptografia de ponta a ponta. Somente as pessoas que fazem parte da conversa podem ler, ouvir e compartilhar esse conteúdo. *Saiba mais*
+23/03/2026 10:39 - Escola Décia L M dos Santos: Oi mãe, tudo bem? Aqui e da escola Decia. O(a) LORENZO GABRIEL CALASTRI GOMES faltou nos dias 23. Pode nos dizer se esta tudo certo?
+23/03/2026 10:40 - +55 14 99654-0407: Oiii não entendi
+23/03/2026 10:40 - +55 14 99654-0407: Ele não foi hj?
+23/03/2026 10:43 - Escola Décia L M dos Santos: bom dia, estamos implementando o sistema de busca ativa automatico para os alunos que faltaram. 
+O sistema ainda não considera algumas situações específicas, o Lorenzo chegou um pouco atrasado e não respondeu a chamada da primeira aula
+23/03/2026 10:43 - Escola Décia L M dos Santos: obrigado pela comunicação
+23/03/2026 10:44 - +55 14 99654-0407: Sim ele foi atrasado ele não ia na escola hj pq ele não está bem está com febre.. mas ele disse que hj teria 2 provas e precisou ir...
+23/03/2026 10:44 - +55 14 99654-0407: Por isso ele chegou atrasado

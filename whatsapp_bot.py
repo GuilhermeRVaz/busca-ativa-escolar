@@ -2,14 +2,16 @@ from urllib.parse import quote
 
 
 class WhatsAppLinkBuilder:
-    def __init__(self, message_template: str) -> None:
+    def __init__(self, message_template: str, school_name: str = "Escola Decia") -> None:
         self.message_template = message_template
+        self.school_name = (school_name or "Escola Decia").strip() or "Escola Decia"
 
     def build_message(self, parent_name: str, student_name: str, absence_days: str = "") -> str:
         return self.message_template.format(
-            parent_name=(parent_name or "responsável").strip(),
+            parent_name=(parent_name or "responsavel").strip(),
             student_name=(student_name or "aluno(a)").strip(),
-            absence_days=(absence_days or "dias não informados").strip(),
+            absence_days=(absence_days or "dias nao informados").strip(),
+            school_name=self.school_name,
         )
 
     def build_link(self, phone_number: str, message: str) -> str:

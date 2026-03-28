@@ -26,6 +26,7 @@ class ActiveSchoolSearchProcessor:
         self.settings = settings or get_settings()
         self.link_builder = WhatsAppLinkBuilder(
             self.settings.whatsapp_message_template,
+            school_name=self.settings.school_name,
         )
 
     def load_absence_report(self, report_path: Optional[Path] = None) -> pd.DataFrame:
@@ -78,9 +79,9 @@ class ActiveSchoolSearchProcessor:
         prepared["absence_days"] = normalized_days.apply(_extract_absence_days, axis=1)
 
         prepared = prepared[prepared["ra_key"].notna()].copy()
-        prepared = prepared[prepared["absence_days_with_records"] >= 2].copy()
+        prepared = prepared[prepared["absence_days_with_records"] >= 1].copy()
 
-        logger.info("Relatorio processado com %s aluno(s) com >=2 faltas.", len(prepared))
+        logger.info("Relatorio processado com %s aluno(s) com >=1 faltas.", len(prepared))
         return prepared
 
     def load_contacts_from_google_sheet(self) -> pd.DataFrame:

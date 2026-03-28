@@ -28,7 +28,15 @@ class Settings:
     google_service_account_file: Path
     default_country_code: str
     default_ddd: str
+    school_name: str
     whatsapp_message_template: str
+    sender_safety_profile: str
+    sender_default_max_messages: int
+    sender_default_batch_size: int
+    sender_default_message_delay_min_seconds: float
+    sender_default_message_delay_max_seconds: float
+    sender_default_batch_break_min_seconds: float
+    sender_default_batch_break_max_seconds: float
 
 
 def get_settings() -> Settings:
@@ -54,12 +62,28 @@ def get_settings() -> Settings:
         ),
         default_country_code=os.getenv("DEFAULT_COUNTRY_CODE", "55").strip(),
         default_ddd=os.getenv("DEFAULT_DDD", "18").strip(),
+        school_name=os.getenv("SCHOOL_NAME", "Escola Decia").strip() or "Escola Decia",
         whatsapp_message_template=os.getenv(
             "WHATSAPP_MESSAGE_TEMPLATE",
             (
-                "Olá {parent_name}, aqui é da escola. Informamos que o(a) aluno(a) "
+                "Ola {parent_name}, aqui e da {school_name}. Informamos que o(a) aluno(a) "
                 "{student_name} apresentou faltas nos dias: {absence_days}. "
                 "Pedimos que informe a justificativa ou entre em contato com a escola."
             ),
         ).strip(),
+        sender_safety_profile=os.getenv("SENDER_SAFETY_PROFILE", "conservative").strip().lower() or "conservative",
+        sender_default_max_messages=int(os.getenv("SENDER_DEFAULT_MAX_MESSAGES", "8").strip() or "8"),
+        sender_default_batch_size=int(os.getenv("SENDER_DEFAULT_BATCH_SIZE", "3").strip() or "3"),
+        sender_default_message_delay_min_seconds=float(
+            os.getenv("SENDER_DEFAULT_MESSAGE_DELAY_MIN_SECONDS", "60").strip() or "60",
+        ),
+        sender_default_message_delay_max_seconds=float(
+            os.getenv("SENDER_DEFAULT_MESSAGE_DELAY_MAX_SECONDS", "150").strip() or "150",
+        ),
+        sender_default_batch_break_min_seconds=float(
+            os.getenv("SENDER_DEFAULT_BATCH_BREAK_MIN_SECONDS", "600").strip() or "600",
+        ),
+        sender_default_batch_break_max_seconds=float(
+            os.getenv("SENDER_DEFAULT_BATCH_BREAK_MAX_SECONDS", "1200").strip() or "1200",
+        ),
     )

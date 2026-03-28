@@ -1,0 +1,65 @@
+{
+  "saude": [
+    "doente",
+    "dor de cabeca",
+    "dor de garganta",
+    "colica",
+    "vomit",
+    "vomito",
+    "diarreia",
+    "febre",
+    "hospital",
+    "medico",
+    "medica",
+    "consulta",
+    "atestado",
+    "nao passou bem"
+  ],
+  "perdeu_a_hora": [
+    "atrasou",
+    "perdeu a hora",
+    "perdeu hora",
+    "alarme",
+    "nao acordou",
+    "nao levantou",
+    "perdeu o onibus",
+    "perdeu onibus",
+    "perdeu o horario",
+    "perdeu horario"
+  ],
+  "transporte": [
+    "onibus",
+    "conducao",
+    "transporte",
+    "carro quebrou",
+    "sem conduca",
+    "sem transporte"
+  ],
+  "familia": [
+    "mae",
+    "pai",
+    "avo",
+    "familia",
+    "casa",
+    "problema em casa"
+  ],
+  "trabalho_responsavel": [
+    "trabalho",
+    "servico",
+    "emprego",
+    "plantao",
+    "turno"
+  ],
+  "mudanca_transferencia": [
+    "mudou",
+    "mudanca",
+    "transfer",
+    "endereco",
+    "mudou de cidade"
+  ],
+  "sem_justificativa": [
+    "sem justificativa",
+    "nao justificou",
+    "não justificou"
+  ]
+}
